@@ -1,0 +1,17 @@
+{
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@agentmemory/agentmemory": "^0.9.28",
+    "@colbymchenry/codegraph": "^1.5.0"
+  },
+  "scripts": {
+    "bot:start": "node src/bot.js",
+    "codegraph:init": "codegraph init .",
+    "codegraph:status": "codegraph status .",
+    "memory:start": "agentmemory",
+    "memory:status": "agentmemory status",
+    "memory:doctor": "agentmemory doctor --dry-run"
+  }
+}
