@@ -1,23 +1,75 @@
 const fs = require("node:fs/promises");
+const http = require("node:http");
 const path = require("node:path");
 const { execFile: execFileCallback } = require("node:child_process");
 const { promisify } = require("node:util");
+const { createJobSources } = require("./jobSources");
+const {
+  activeFoundJobs,
+  buildJoobleQuery,
+  canonicalJobKey,
+  defaultDigestSettings,
+  defaultLearnedPreferences,
+  dueDigestSlot,
+  ensureUserCollections,
+  hasJobAlreadyBeenSent,
+  inferWorkFormat,
+  isEmptyValue,
+  jobContainsExcludedTerm,
+  jobMatchesHardPreferences,
+  joobleJobToCandidate,
+  localDateTimeParts,
+  lowerList,
+  normalizeJobCandidate,
+  normalizeSalary,
+  normalizeSearchProfile,
+  profileBlockedTerms,
+  profileHasSearchData,
+  profileMatchesCandidate,
+  rankCandidatesForUser,
+  scoreCandidateForUser,
+  splitList,
+  storeFoundJobs,
+  TOKEN_STOPWORDS,
+  uniqueTokens,
+} = require("./jobMatching");
 const storage = require("./storage");
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const ENV_PATH = path.join(PROJECT_ROOT, ".env");
-const DATA_DIR = path.join(PROJECT_ROOT, "data");
+const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(PROJECT_ROOT, "data"));
 const UPLOADS_DIR = path.join(DATA_DIR, "uploads");
 const USERS_PATH = path.join(DATA_DIR, "users.json");
 const STATE_PATH = path.join(DATA_DIR, "bot-state.json");
+const LOCK_PATH = path.join(DATA_DIR, "bot.lock");
 const EXTRACT_SCRIPT_PATH = path.join(PROJECT_ROOT, "scripts", "extract_resume_text.py");
 const execFile = promisify(execFileCallback);
+const FAVORITES_BUTTON_TEXT = "Избранное";
+const MAX_TELEGRAM_MESSAGE_LENGTH = 3900;
+let telegramTransportForTests = null;
 
-const START_KEYBOARD = [
-  ["Загрузить резюме"],
-  ["Найти вакансии сейчас", "Показать найденные"],
-  ["Заполнить профиль вручную", "Показать профиль"],
-];
+function telegramWebAppUrl() {
+  return (process.env.TELEGRAM_WEBAPP_URL || process.env.FAVORITES_WEBAPP_URL || "").trim();
+}
+
+function favoritesApiUrl() {
+  return (process.env.FAVORITES_API_URL || telegramWebAppUrl()).trim().replace(/\/+$/, "");
+}
+
+function favoritesKeyboardButton() {
+  const url = telegramWebAppUrl();
+  return url ? { text: FAVORITES_BUTTON_TEXT, web_app: { url } } : FAVORITES_BUTTON_TEXT;
+}
+
+function startKeyboard() {
+  return [
+    ["Загрузить резюме"],
+    ["Найти вакансии сейчас", "Показать найденные"],
+    [favoritesKeyboardButton(), "Инструкция"],
+    ["Статус источников"],
+    ["Заполнить профиль вручную", "Показать профиль"],
+  ];
+}
 
 const RESUME_REVIEW_KEYBOARD = [
   ["Все верно, создать профиль"],
@@ -55,25 +107,19 @@ const FEEDBACK_STATUS_BY_SIGNAL = {
   s: "saved",
 };
 
-const DIGEST_SLOTS = ["09:00", "13:00", "21:00"];
-const DEFAULT_TIMEZONE = "Europe/Kiev";
 const SCHEDULER_INTERVAL_MS = 60 * 1000;
-const PROFILE_STATUSES = new Set(["draft", "active", "needs_review"]);
 
-const TOKEN_STOPWORDS = new Set([
-  "the",
-  "and",
-  "for",
-  "with",
-  "про",
-  "для",
-  "или",
-  "та",
-  "менеджер",
-  "manager",
-  "спеціаліст",
-  "специалист",
-]);
+const SOURCE_LABELS = {
+  jooble: "Jooble",
+  dou: "DOU",
+  djinni: "Djinni",
+  workua: "Work.ua",
+  robotaua: "robota.ua",
+  jobsua: "Jobs.ua",
+  olxua: "OLX Robota",
+  happymonday: "Happy Monday",
+  lobbyx: "Lobby X",
+};
 
 const PREFERENCE_FIELDS = [
   {
@@ -245,89 +291,69 @@ async function saveBotState(state) {
   await storage.saveBotState(state);
 }
 
-function nowIso() {
-  return new Date().toISOString();
+async function readLockPid() {
+  try {
+    const content = await fs.readFile(LOCK_PATH, "utf8");
+    const pid = Number(content.trim());
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
 }
 
-function splitList(value) {
-  return value
-    .split(",")
-    .map((item) => item.trim())
-    .filter(Boolean);
+function processIsRunning(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
 }
 
-function tokenize(value) {
-  return String(value || "")
-    .toLowerCase()
-    .match(/[\p{L}\p{N}+#.]{3,}/gu)?.filter((token) => !TOKEN_STOPWORDS.has(token)) || [];
-}
+async function acquireBotLock() {
+  await fs.mkdir(DATA_DIR, { recursive: true, mode: 0o700 });
 
-function uniqueTokens(value) {
-  return [...new Set(tokenize(value))];
-}
+  try {
+    const handle = await fs.open(LOCK_PATH, "wx", 0o600);
+    await handle.writeFile(`${process.pid}\n`);
+    await handle.close();
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
 
-function tokenOverlapScore(leftTokens, rightTokens, pointsPerToken, maxPoints) {
-  if (!leftTokens.length || !rightTokens.length) return 0;
-  const right = new Set(rightTokens);
-  const overlap = leftTokens.filter((token) => right.has(token)).length;
-  return Math.min(maxPoints, overlap * pointsPerToken);
-}
+    const lockPid = await readLockPid();
+    if (lockPid && processIsRunning(lockPid)) {
+      throw new Error(`Another bot process is already running with PID ${lockPid}`);
+    }
 
-function isEmptyValue(value) {
-  return value === undefined || value === null || value === "";
-}
-
-function normalizeSalary(value) {
-  const raw = value.trim();
-  const lowered = raw.toLowerCase();
-
-  if (["не важно", "неважно", "любая", "любой", "skip", "-"].includes(lowered)) {
-    return {
-      raw,
-      amount: null,
-      currency: null,
-      negotiable: true,
-    };
+    await fs.unlink(LOCK_PATH).catch((unlinkError) => {
+      if (unlinkError.code !== "ENOENT") throw unlinkError;
+    });
+    return acquireBotLock();
   }
 
-  const amountMatch = raw.match(/\d[\d\s,.]*/);
-  const amount = amountMatch
-    ? Number(amountMatch[0].replace(/\s/g, "").replace(",", "."))
-    : null;
-
-  let currency = null;
-  if (/\$|usd|дол/i.test(raw)) currency = "USD";
-  if (/€|eur|евр/i.test(raw)) currency = "EUR";
-  if (/грн|uah|₴/i.test(raw)) currency = "UAH";
-
-  return {
-    raw,
-    amount,
-    currency,
-    negotiable: false,
+  const release = async () => {
+    const lockPid = await readLockPid().catch(() => null);
+    if (lockPid === process.pid) {
+      await fs.unlink(LOCK_PATH).catch(() => {});
+    }
   };
+
+  process.once("exit", () => {
+    try {
+      require("node:fs").unlinkSync(LOCK_PATH);
+    } catch {}
+  });
+  process.once("SIGINT", () => {
+    release().finally(() => process.exit(130));
+  });
+  process.once("SIGTERM", () => {
+    release().finally(() => process.exit(143));
+  });
 }
 
-function salaryAmountForSearch(value) {
-  if (!value || typeof value !== "object" || value.negotiable || !value.amount) return null;
-  if (value.currency && value.currency !== "UAH") return null;
-  return Math.round(value.amount);
-}
-
-function parseSalaryText(value) {
-  const raw = String(value || "");
-  const numbers = raw.match(/\d[\d\s,.]*/g)?.map((item) => Number(item.replace(/\s/g, "").replace(",", "."))).filter(Number.isFinite) || [];
-  let currency = null;
-  if (/\$|usd|дол/i.test(raw)) currency = "USD";
-  if (/€|eur|евр/i.test(raw)) currency = "EUR";
-  if (/грн|uah|₴/i.test(raw)) currency = "UAH";
-
-  return {
-    raw,
-    min: numbers.length ? Math.min(...numbers) : null,
-    max: numbers.length ? Math.max(...numbers) : null,
-    currency,
-  };
+function nowIso() {
+  return new Date().toISOString();
 }
 
 function normalizeAnswer(fieldKey, value) {
@@ -352,125 +378,6 @@ function normalizeAnswer(fieldKey, value) {
   }
 
   return trimmed;
-}
-
-function profileHasSearchData(profile = {}) {
-  return Object.keys(profile).some((key) => {
-    if (["status", "updatedAt", "source", "resumeId"].includes(key)) return false;
-    const value = profile[key];
-    if (Array.isArray(value)) return value.length > 0;
-    if (typeof value === "object" && value) return Object.values(value).some((item) => !isEmptyValue(item));
-    return !isEmptyValue(value);
-  });
-}
-
-function normalizeSearchProfile(profile = {}) {
-  if (!profile || typeof profile !== "object") return {};
-  const normalized = {
-    ...profile,
-    mustHave: Array.isArray(profile.mustHave) ? profile.mustHave : splitList(profile.mustHave || ""),
-    niceToHave: Array.isArray(profile.niceToHave) ? profile.niceToHave : splitList(profile.niceToHave || ""),
-    exclusions: Array.isArray(profile.exclusions) ? profile.exclusions : splitList(profile.exclusions || ""),
-    hiddenCompanies: Array.isArray(profile.hiddenCompanies) ? profile.hiddenCompanies : splitList(profile.hiddenCompanies || ""),
-  };
-
-  if (!PROFILE_STATUSES.has(normalized.status)) {
-    normalized.status = profileHasSearchData(normalized) ? "active" : "draft";
-  }
-
-  return normalized;
-}
-
-function defaultLearnedPreferences() {
-  return {
-    preferredKeywords: [],
-    avoidedKeywords: [],
-    preferredCompanies: [],
-    avoidedCompanies: [],
-    pendingSuggestions: [],
-    confirmedSuggestions: [],
-    dismissedSuggestions: [],
-    formatWeight: 1,
-    salaryWeight: 1,
-    domainWeight: 1,
-    seniorityWeight: 1,
-    feedbackSignalsCount: 0,
-    updatedAt: null,
-  };
-}
-
-function defaultDigestSettings() {
-  return {
-    enabled: true,
-    timezone: DEFAULT_TIMEZONE,
-    slots: [...DIGEST_SLOTS],
-    lastRunSlots: {},
-  };
-}
-
-function ensureUserCollections(user) {
-  user.searchProfile = normalizeSearchProfile(user.searchProfile || {});
-  user.sentJobs = Array.isArray(user.sentJobs) ? user.sentJobs : [];
-  user.jobFeedback = Array.isArray(user.jobFeedback) ? user.jobFeedback : [];
-  user.foundJobs = Array.isArray(user.foundJobs) ? user.foundJobs : [];
-  user.learnedPreferences = {
-    ...defaultLearnedPreferences(),
-    ...(user.learnedPreferences || {}),
-  };
-  user.learnedPreferences.pendingSuggestions = Array.isArray(user.learnedPreferences.pendingSuggestions)
-    ? user.learnedPreferences.pendingSuggestions
-    : [];
-  user.learnedPreferences.confirmedSuggestions = Array.isArray(user.learnedPreferences.confirmedSuggestions)
-    ? user.learnedPreferences.confirmedSuggestions
-    : [];
-  user.learnedPreferences.dismissedSuggestions = Array.isArray(user.learnedPreferences.dismissedSuggestions)
-    ? user.learnedPreferences.dismissedSuggestions
-    : [];
-  user.digestSettings = {
-    ...defaultDigestSettings(),
-    ...(user.digestSettings || {}),
-    slots: Array.isArray(user.digestSettings?.slots) && user.digestSettings.slots.length
-      ? user.digestSettings.slots
-      : [...DIGEST_SLOTS],
-    lastRunSlots: user.digestSettings?.lastRunSlots || {},
-  };
-  return user;
-}
-
-function localDateTimeParts(date = new Date(), timezone = DEFAULT_TIMEZONE) {
-  const formatter = new Intl.DateTimeFormat("en-CA", {
-    timeZone: timezone || DEFAULT_TIMEZONE,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  });
-  const parts = Object.fromEntries(formatter.formatToParts(date).map((part) => [part.type, part.value]));
-
-  return {
-    date: `${parts.year}-${parts.month}-${parts.day}`,
-    time: `${parts.hour}:${parts.minute}`,
-  };
-}
-
-function dueDigestSlot(user, date = new Date()) {
-  ensureUserCollections(user);
-  const settings = user.digestSettings;
-  if (!settings.enabled) return null;
-
-  const current = localDateTimeParts(date, settings.timezone);
-  if (!settings.slots.includes(current.time)) return null;
-
-  const slotKey = `${current.date} ${current.time}`;
-  if (settings.lastRunSlots[slotKey]) return null;
-
-  return {
-    slot: current.time,
-    slotKey,
-    date: current.date,
-  };
 }
 
 function normalizeResumeAnalysis(raw) {
@@ -610,6 +517,12 @@ function formatValue(value) {
   return isEmptyValue(value) ? "не указано" : String(value);
 }
 
+function telegramText(value) {
+  const text = String(value || "");
+  if (text.length <= MAX_TELEGRAM_MESSAGE_LENGTH) return text;
+  return `${text.slice(0, MAX_TELEGRAM_MESSAGE_LENGTH - 80)}\n\nТекст сокращен. Полная вакансия доступна по ссылке источника.`;
+}
+
 function formatProfile(profile = {}) {
   const normalized = normalizeSearchProfile(profile);
   const statusLabel = normalized.status === "active"
@@ -630,6 +543,31 @@ function formatProfile(profile = {}) {
     `Желательно: ${formatValue(normalized.niceToHave)}`,
     `Что не предлагать: ${formatValue(normalized.exclusions)}`,
     `Скрытые компании: ${formatValue(normalized.hiddenCompanies)}`,
+  ].join("\n");
+}
+
+function guideText() {
+  return [
+    "Привет. Я помогу искать подходящие вакансии по твоему резюме.",
+    "",
+    "Как это работает:",
+    "1. Загрузи резюме PDF, DOCX или TXT.",
+    "2. Я составлю черновик профиля поиска.",
+    "3. Ты проверишь роли, локацию, формат, зарплату и ограничения.",
+    "4. Я буду присылать вакансии, а по твоим реакциям подбор станет точнее.",
+    "",
+    "Основные функции:",
+    "Автоподбор - вакансии приходят в 09:00, 13:00 и 21:00 по Киеву.",
+    "Найти вакансии сейчас - ручной запуск поиска в любой момент.",
+    "Показать найденные - список уже найденных вакансий.",
+    "Избранное - отдельное окно со сохраненными вакансиями для отклика.",
+    "Статус источников - показывает, какие платформы отработали в последнем поиске.",
+    "",
+    "Под вакансиями можно нажимать:",
+    "Подходит, Не подходит, Сохранить или Скрыть похожие.",
+    "",
+    "Начать лучше с кнопки «Загрузить резюме».",
+    "В конце каждой вакансии есть ссылка на источник. Данные можно удалить командой /delete_my_data.",
   ].join("\n");
 }
 
@@ -670,323 +608,6 @@ function makeShortId(prefix = "j") {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function normalizeJobCandidate(candidate) {
-  const sourceUrl = candidate.sourceUrl || candidate.url || candidate.source_url;
-  if (!candidate.title || !sourceUrl) return null;
-
-  return {
-    shortId: candidate.shortId || makeShortId("j"),
-    externalId: candidate.externalId || candidate.external_id || null,
-    source: candidate.source || "unknown",
-    sourceUrl,
-    title: candidate.title,
-    company: candidate.company || "не указано",
-    location: candidate.location || "не указано",
-    format: candidate.format || "не указано",
-    salary: candidate.salary || "не указано",
-    description: candidate.description || "",
-    reasons: Array.isArray(candidate.reasons) ? candidate.reasons.filter(Boolean) : [],
-    risks: Array.isArray(candidate.risks) ? candidate.risks.filter(Boolean) : [],
-    score: Number.isFinite(candidate.score) ? candidate.score : null,
-  };
-}
-
-function canonicalJobKey(job) {
-  return [
-    job.title,
-    job.company,
-    job.location,
-  ]
-    .map((part) => String(part || "").toLowerCase().replace(/\s+/g, " ").trim())
-    .join("|");
-}
-
-function inferWorkFormat(job) {
-  const text = [
-    job.type,
-    job.title,
-    job.location,
-    job.snippet,
-    job.description,
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
-
-  if (/remote|віддал|удален|remotely|work from home/.test(text)) return "Remote";
-  if (/hybrid|гібрид|гибрид/.test(text)) return "Hybrid";
-  if (/office|офіс|офис/.test(text)) return "Office";
-  return job.type || "не указано";
-}
-
-function lowerList(value) {
-  if (Array.isArray(value)) return value.map((item) => String(item).toLowerCase()).filter(Boolean);
-  return splitList(String(value || "")).map((item) => item.toLowerCase());
-}
-
-function profileBlockedTerms(searchProfile = {}) {
-  return [
-    ...lowerList(searchProfile.exclusions),
-    ...lowerList(searchProfile.hiddenCompanies),
-  ];
-}
-
-function jobContainsExcludedTerm(job, exclusions) {
-  if (!exclusions.length) return false;
-  const text = jobSearchText(job);
-  return exclusions.some((term) => term && text.includes(term));
-}
-
-function hiddenCompanyMatches(candidate, searchProfile = {}) {
-  const hiddenCompanies = lowerList(searchProfile.hiddenCompanies);
-  const company = String(candidate.company || "").toLowerCase();
-  return hiddenCompanies.some((companyName) => companyName && company.includes(companyName));
-}
-
-function scorePreferenceTerms(candidate, profile) {
-  const candidateTokens = uniqueTokens(`${candidate.title} ${candidate.company} ${candidate.description}`);
-  const mustHaveTokens = uniqueTokens(lowerList(profile.mustHave).join(" "));
-  const niceToHaveTokens = uniqueTokens(lowerList(profile.niceToHave).join(" "));
-  const mustHaveScore = tokenOverlapScore(mustHaveTokens, candidateTokens, 5, 15);
-  const niceToHaveScore = tokenOverlapScore(niceToHaveTokens, candidateTokens, 3, 9);
-  const reasons = [];
-  const risks = [];
-
-  if (mustHaveTokens.length && mustHaveScore > 0) {
-    reasons.push("Есть совпадения с обязательными требованиями профиля.");
-  }
-
-  if (mustHaveTokens.length && mustHaveScore === 0) {
-    risks.push("Не вижу явного совпадения с обязательными требованиями, стоит проверить.");
-  }
-
-  if (niceToHaveScore > 0) {
-    reasons.push("Есть совпадения с желательными пунктами профиля.");
-  }
-
-  return {
-    score: mustHaveScore + niceToHaveScore,
-    reasons,
-    risks,
-  };
-}
-
-function jobSearchText(job) {
-  return [
-    job.title,
-    job.company,
-    job.location,
-    job.description,
-    job.snippet,
-    job.source,
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
-}
-
-function jobMatchesMustHave(job, mustHave) {
-  if (!mustHave.length) return true;
-  const text = jobSearchText(job);
-  return mustHave.every((term) => {
-    const lowered = String(term || "").toLowerCase().trim();
-    if (!lowered) return true;
-    return text.includes(lowered) || tokenOverlapScore(uniqueTokens(lowered), uniqueTokens(text), 1, 3) >= Math.min(2, uniqueTokens(lowered).length);
-  });
-}
-
-function jobMatchesHiddenCompanies(job, hiddenCompanies) {
-  if (!hiddenCompanies.length) return true;
-  const company = String(job.company || "").toLowerCase();
-  return !hiddenCompanies.some((item) => item && company.includes(String(item).toLowerCase()));
-}
-
-function jobMatchesHardPreferences(profile, job, user = null) {
-  const normalized = normalizeSearchProfile(profile);
-  const hiddenCompanies = [
-    ...(normalized.hiddenCompanies || []),
-    ...(user?.learnedPreferences?.avoidedCompanies || []),
-  ];
-  return !jobContainsExcludedTerm(job, profileBlockedTerms(normalized)) &&
-    jobMatchesMustHave(job, normalized.mustHave || []) &&
-    jobMatchesHiddenCompanies(job, hiddenCompanies);
-}
-
-function scoreFormat(candidate, profile) {
-  const preferred = String(profile.format || "").toLowerCase();
-  const format = String(candidate.format || "").toLowerCase();
-  const candidateText = `${candidate.title || ""} ${candidate.location || ""} ${candidate.description || ""}`.toLowerCase();
-  const isRemote = format.includes("remote") || /remote|віддал|удален/.test(candidateText);
-  const isHybrid = format.includes("hybrid") || /hybrid|гібрид|гибрид/.test(candidateText);
-  const isOffice = format.includes("office") || /office|офіс|офис/.test(candidateText);
-
-  if (!preferred || preferred.includes("любой") || preferred.includes("будь") || preferred.includes("any")) {
-    return { score: 0, risk: null };
-  }
-
-  if (preferred.includes("remote")) {
-    if (isRemote) return { score: 18, risk: null };
-    if (isHybrid && !preferred.includes("только")) return { score: 8, risk: null };
-    if (isOffice) return { score: -18, risk: "Формат может не совпадать с предпочтением remote." };
-    return { score: -3, risk: "Формат работы нужно проверить в источнике." };
-  }
-
-  if (preferred.includes("hybrid") || preferred.includes("гібрид") || preferred.includes("гибрид")) {
-    if (isHybrid || isRemote) return { score: 10, risk: null };
-    if (isOffice) return { score: -8, risk: "Формат может быть офисным, стоит проверить." };
-  }
-
-  if (preferred.includes("office") || preferred.includes("офіс") || preferred.includes("офис")) {
-    if (isOffice) return { score: 10, risk: null };
-    if (isRemote) return { score: -8, risk: "Вакансия может быть remote, а профиль просит office." };
-  }
-
-  return { score: 0, risk: null };
-}
-
-function scoreLocation(candidate, profile) {
-  const desired = String(profile.location || "").toLowerCase();
-  if (!desired) return 0;
-
-  const candidateText = `${candidate.location || ""} ${candidate.description || ""}`.toLowerCase();
-  if (/remote|віддал|удален|global/.test(desired) && /remote|віддал|удален/.test(candidateText)) return 12;
-  if (desired.includes("ukraine") || desired.includes("укра")) {
-    return /ukraine|укра|kyiv|київ|киев|lviv|львів|львов|odesa|одеса|дніпро|dnipro/.test(candidateText) ? 10 : 0;
-  }
-
-  const desiredTokens = uniqueTokens(desired);
-  return tokenOverlapScore(desiredTokens, uniqueTokens(candidateText), 5, 10);
-}
-
-function scoreSalary(candidate, profile) {
-  const desired = profile.minSalary;
-  if (!desired || typeof desired !== "object" || desired.negotiable || !desired.amount) return { score: 0, risk: null };
-
-  const salary = parseSalaryText(candidate.salary);
-  if (!salary.max) return { score: -4, risk: "Зарплата не указана, нужно проверить условия." };
-  if (desired.currency && salary.currency && desired.currency !== salary.currency) {
-    return { score: 0, risk: "Валюта зарплаты отличается от профиля, без ручной проверки не сравниваю." };
-  }
-  if (desired.currency && !salary.currency) {
-    return { score: 0, risk: "Валюта зарплаты не указана, нужно проверить вручную." };
-  }
-
-  if (salary.max < desired.amount) {
-    return { score: -25, risk: "Зарплата может быть ниже указанного минимума." };
-  }
-  if (salary.min && salary.min >= desired.amount) return { score: 12, risk: null };
-  return { score: 7, risk: null };
-}
-
-function feedbackWeight(signal) {
-  if (signal === "s") return 16;
-  if (signal === "l") return 10;
-  if (signal === "d") return -12;
-  if (signal === "h") return -22;
-  return 0;
-}
-
-function feedbackAdjustmentForCandidate(user, candidate) {
-  const sentByShortId = new Map((user.sentJobs || []).map((job) => [job.shortId, job]));
-  const candidateTokens = uniqueTokens(`${candidate.title} ${candidate.company} ${candidate.description}`);
-  let score = 0;
-  let positive = false;
-  let negative = false;
-
-  for (const feedback of user.jobFeedback || []) {
-    const previousJob = sentByShortId.get(feedback.jobShortId);
-    if (!previousJob) continue;
-
-    const weight = feedbackWeight(feedback.signal);
-    if (!weight) continue;
-
-    let similarity = 0;
-    if (previousJob.company && candidate.company && previousJob.company === candidate.company) similarity += 0.45;
-    if (previousJob.source && candidate.source && previousJob.source === candidate.source) similarity += 0.1;
-    const previousTokens = uniqueTokens(`${previousJob.title} ${previousJob.company} ${previousJob.description}`);
-    const overlap = tokenOverlapScore(candidateTokens, previousTokens, 1, 6);
-    similarity += overlap / 12;
-
-    if (similarity <= 0.2) continue;
-    const adjustment = Math.round(weight * Math.min(1, similarity));
-    score += adjustment;
-    if (adjustment > 0) positive = true;
-    if (adjustment < 0) negative = true;
-  }
-
-  return { score: Math.max(-30, Math.min(24, score)), positive, negative };
-}
-
-function scoreCandidateForUser(user, candidate) {
-  const profile = user.searchProfile || {};
-  const roles = lowerList(profile.roles);
-  const titleLower = String(candidate.title || "").toLowerCase();
-  const descriptionLower = String(candidate.description || "").toLowerCase();
-  const roleTokens = uniqueTokens(roles.join(" "));
-  const candidateTokens = uniqueTokens(`${candidate.title} ${candidate.description}`);
-  const reasons = [...(candidate.reasons || [])];
-  const risks = [...(candidate.risks || [])];
-  let score = 0;
-
-  if (roles.some((role) => role.length >= 4 && titleLower.includes(role))) {
-    score += 45;
-    reasons.unshift("Название вакансии хорошо совпадает с ролью из профиля.");
-  } else if (roles.some((role) => role.length >= 4 && descriptionLower.includes(role))) {
-    score += 25;
-    reasons.unshift("Описание вакансии совпадает с ролью из профиля.");
-  } else {
-    score += tokenOverlapScore(roleTokens, candidateTokens, 6, 24);
-  }
-
-  const formatScore = scoreFormat(candidate, profile);
-  score += formatScore.score;
-  if (formatScore.risk) risks.push(formatScore.risk);
-
-  score += scoreLocation(candidate, profile);
-
-  const salaryScore = scoreSalary(candidate, profile);
-  score += salaryScore.score;
-  if (salaryScore.risk) risks.push(salaryScore.risk);
-
-  const preferenceTerms = scorePreferenceTerms(candidate, profile);
-  score += preferenceTerms.score;
-  reasons.push(...preferenceTerms.reasons);
-  risks.push(...preferenceTerms.risks);
-
-  const languageTokens = uniqueTokens(profile.languages || "");
-  const languageScore = tokenOverlapScore(languageTokens, candidateTokens, 4, 8);
-  if (languageScore > 0) {
-    score += languageScore;
-    reasons.push("Языковые требования похожи на профиль.");
-  }
-
-  const feedback = feedbackAdjustmentForCandidate(user, candidate);
-  score += feedback.score;
-  if (feedback.positive) reasons.push("Похожа на вакансии, которые ты уже отмечал положительно.");
-  if (feedback.negative) risks.push("Похожа на вакансии, которые ты раньше отклонял.");
-
-  return {
-    ...candidate,
-    score,
-    reasons: [...new Set(reasons)].slice(0, 4),
-    risks: [...new Set(risks)].slice(0, 4),
-  };
-}
-
-function rankCandidatesForUser(user, candidates) {
-  ensureUserCollections(user);
-  return candidates
-    .map((candidate, index) => ({
-      candidate: scoreCandidateForUser(user, candidate),
-      index,
-    }))
-    .sort((left, right) => {
-      const scoreDiff = (right.candidate.score || 0) - (left.candidate.score || 0);
-      return scoreDiff || left.index - right.index;
-    })
-    .map((item) => item.candidate);
-}
-
 function decodeXmlEntities(value) {
   return String(value || "")
     .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
@@ -1022,88 +643,41 @@ function parseRssItems(xml) {
   });
 }
 
-function profileMatchesCandidate(searchProfile, candidate) {
-  const roles = lowerList(searchProfile.roles);
-  if (!roles.length) return false;
-  const text = `${candidate.title || ""} ${candidate.description || ""}`.toLowerCase();
-  const roleTokens = uniqueTokens(roles.join(" "));
-  return roles.some((role) => role.length >= 4 && text.includes(role)) ||
-    tokenOverlapScore(roleTokens, uniqueTokens(text), 1, 2) >= 2;
-}
+const jobSources = createJobSources({
+  buildJoobleQuery,
+  inferWorkFormat,
+  jobContainsExcludedTerm,
+  joobleJobToCandidate,
+  parseRssItems,
+  profileBlockedTerms,
+  profileMatchesCandidate,
+});
 
-function buildJoobleQuery(searchProfile = {}) {
-  const roles = Array.isArray(searchProfile.roles)
-    ? searchProfile.roles.filter(Boolean)
-    : splitList(searchProfile.roles || "");
-  const keywords = roles.slice(0, 4).join(", ");
-
-  if (!keywords) {
-    return null;
-  }
-
-  const locationText = String(searchProfile.location || "").trim();
-  const firstLocation = splitList(locationText)[0] || locationText;
-  const location = /remote|віддал|удален|global|any|любой|будь/i.test(firstLocation)
-    ? "Ukraine"
-    : firstLocation || "Ukraine";
-
-  const query = {
-    keywords,
-    location,
-    radius: "80",
-    page: "1",
-    ResultOnPage: "20",
-    companysearch: "false",
-  };
-
-  const salary = salaryAmountForSearch(searchProfile.minSalary);
-  if (salary) query.salary = salary;
-
-  return query;
-}
-
-function joobleJobToCandidate(job, searchProfile = {}) {
-  const sourceUrl = job.link || job.url || job.sourceUrl;
-  if (!job.title || !sourceUrl) return null;
-
-  const reasons = [];
-  const risks = [];
-  const roles = lowerList(searchProfile.roles);
-  const title = String(job.title || "");
-  const titleLower = title.toLowerCase();
-
-  if (roles.some((role) => titleLower.includes(role))) {
-    reasons.push("Название вакансии совпадает с ролью из профиля поиска.");
-  } else {
-    reasons.push("Вакансия найдена по ролям из профиля поиска.");
-  }
-
-  if (searchProfile.format && inferWorkFormat(job) !== "не указано") {
-    reasons.push("Формат работы можно сверить с твоими предпочтениями.");
-  }
-
-  if (!job.salary) {
-    risks.push("Зарплата не указана в источнике.");
-  }
-
-  if (inferWorkFormat(job) === "не указано") {
-    risks.push("Формат работы нужно проверить в описании.");
-  }
-
-  return {
-    source: "jooble",
-    externalId: job.id ? String(job.id) : null,
-    sourceUrl,
-    title,
-    company: job.company || "не указано",
-    location: job.location || "не указано",
-    format: inferWorkFormat(job),
-    salary: job.salary || "Не указана",
-    description: job.snippet || "",
-    reasons,
-    risks,
-  };
-}
+const {
+  djinniItemToCandidate,
+  douItemToCandidate,
+  fetchCandidatesFromSources,
+  fetchDjinniCandidates,
+  fetchDouCandidates,
+  fetchHappyMondayCandidates,
+  fetchJoobleCandidates,
+  fetchJobsUaCandidates,
+  fetchLobbyXCandidates,
+  fetchOlxUaCandidates,
+  fetchRobotaUaCandidates,
+  fetchWorkUaCandidates,
+  happyMondayItemToCandidate,
+  jobsUaJobToCandidate,
+  parseRobotaUaHtml,
+  parseJobsUaHtml,
+  parseOlxUaHtml,
+  parseWorkUaHtml,
+  olxUaJobToCandidate,
+  robotaUaJobToCandidate,
+  splitDjinniTitle,
+  lobbyXItemToCandidate,
+  workUaJobToCandidate,
+} = jobSources;
 
 function formatListSection(title, items) {
   if (!items?.length) return `${title}\n- не указано`;
@@ -1111,19 +685,45 @@ function formatListSection(title, items) {
 }
 
 function formatVacancyMessage(sentJob) {
-  return [
+  const lines = [
     sentJob.title,
     `Компания: ${formatValue(sentJob.company)}`,
     `Локация: ${formatValue(sentJob.location)}`,
     `Формат: ${formatValue(sentJob.format)}`,
     `Зарплата: ${formatValue(sentJob.salary)}`,
     "",
+  ];
+
+  if (sentJob.matchSummary) {
+    lines.push(`Коротко: ${sentJob.matchSummary}`, "");
+  }
+
+  lines.push(
     formatListSection("Почему может подойти:", sentJob.reasons),
     "",
     formatListSection("Что проверить:", sentJob.risks),
     "",
-    `Источник: ${sentJob.sourceUrl}`,
-  ].join("\n");
+    `Источник: ${sentJob.sourceUrl}`
+  );
+
+  return lines.join("\n");
+}
+
+function formatFavoriteMessage(job) {
+  const lines = [
+    job.title,
+    `Компания: ${formatValue(job.company)}`,
+    `Локация: ${formatValue(job.location)}`,
+    `Формат: ${formatValue(job.format)}`,
+    `Зарплата: ${formatValue(job.salary)}`,
+  ];
+
+  if (job.matchSummary) {
+    lines.push("", `Коротко: ${job.matchSummary}`);
+  }
+
+  lines.push("", `Источник: ${job.sourceUrl}`);
+  return lines.join("\n");
 }
 
 function jobFeedbackKeyboard(shortId) {
@@ -1139,6 +739,28 @@ function jobFeedbackKeyboard(shortId) {
           { text: FEEDBACK_SIGNALS.h, callback_data: `j:h:${shortId}` },
         ],
       ],
+    },
+  };
+}
+
+function favoriteActionKeyboard(job) {
+  const row = [];
+  if (job.sourceUrl) row.push({ text: "Источник", url: job.sourceUrl });
+  row.push({ text: "Откликнулся", callback_data: `fav:a:${job.shortId}` });
+  row.push({ text: "Убрать", callback_data: `fav:r:${job.shortId}` });
+  return {
+    reply_markup: {
+      inline_keyboard: [row],
+    },
+  };
+}
+
+function favoritesWebAppKeyboard() {
+  const url = telegramWebAppUrl();
+  if (!url) return null;
+  return {
+    reply_markup: {
+      inline_keyboard: [[{ text: FAVORITES_BUTTON_TEXT, web_app: { url } }]],
     },
   };
 }
@@ -1171,49 +793,6 @@ function createSentJob(user, candidate, searchProfile = {}) {
     feedback: null,
     feedbackUpdatedAt: null,
   };
-}
-
-function hasJobAlreadyBeenSent(user, job) {
-  const key = canonicalJobKey(job);
-  return user.sentJobs.some((sentJob) => {
-    if (job.externalId && sentJob.externalId === job.externalId && sentJob.source === job.source) return true;
-    return sentJob.sourceUrl === job.sourceUrl || canonicalJobKey(sentJob) === key;
-  });
-}
-
-function hasJobAlreadyBeenFound(user, job) {
-  const key = canonicalJobKey(job);
-  return user.foundJobs.some((foundJob) => {
-    if (job.externalId && foundJob.externalId === job.externalId && foundJob.source === job.source) return true;
-    return foundJob.sourceUrl === job.sourceUrl || canonicalJobKey(foundJob) === key;
-  });
-}
-
-function storeFoundJobs(user, candidates) {
-  ensureUserCollections(user);
-  const stored = [];
-
-  for (const candidate of candidates
-    .map(normalizeJobCandidate)
-    .filter(Boolean)
-    .filter((job) => jobMatchesHardPreferences(user.searchProfile || {}, job, user))) {
-    if (hasJobAlreadyBeenFound(user, candidate)) continue;
-    const foundJob = {
-      ...candidate,
-      foundAt: nowIso(),
-      status: "found",
-    };
-    user.foundJobs.push(foundJob);
-    stored.push(foundJob);
-  }
-
-  user.foundJobs = user.foundJobs.slice(-100);
-  return stored;
-}
-
-function activeFoundJobs(user) {
-  ensureUserCollections(user);
-  return user.foundJobs.filter((job) => job.status !== "hidden" && job.status !== "dismissed");
 }
 
 function getFeedbackStats(user) {
@@ -1339,6 +918,7 @@ function makeUserFromMessage(message, existingUser) {
     learnedPreferences: existingUser?.learnedPreferences || defaultLearnedPreferences(),
     digestSettings: existingUser?.digestSettings || defaultDigestSettings(),
     flow: existingUser?.flow || null,
+    onboardingShownAt: existingUser?.onboardingShownAt || null,
     createdAt: existingUser?.createdAt || now,
     updatedAt: now,
   });
@@ -1365,12 +945,17 @@ function makeUserFromCallbackQuery(callbackQuery, existingUser) {
     learnedPreferences: existingUser?.learnedPreferences || defaultLearnedPreferences(),
     digestSettings: existingUser?.digestSettings || defaultDigestSettings(),
     flow: existingUser?.flow || null,
+    onboardingShownAt: existingUser?.onboardingShownAt || null,
     createdAt: existingUser?.createdAt || now,
     updatedAt: now,
   });
 }
 
 async function telegramRequest(method, payload = {}, options = {}) {
+  if (telegramTransportForTests) {
+    return telegramTransportForTests(method, payload, options);
+  }
+
   const token = process.env.TELEGRAM_BOT_TOKEN;
   if (!token) {
     throw new Error("TELEGRAM_BOT_TOKEN is missing in .env");
@@ -1411,298 +996,8 @@ async function telegramRequest(method, payload = {}, options = {}) {
   return data.result;
 }
 
-async function joobleRequest(payload) {
-  const apiKey = process.env.JOOBLE_API_KEY;
-  if (!apiKey) {
-    throw new Error("JOOBLE_API_KEY is missing in .env");
-  }
-
-  const baseUrl = (process.env.JOOBLE_BASE_URL || "https://ua.jooble.org/api").replace(/\/+$/, "");
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), Number(process.env.JOOBLE_TIMEOUT_MS || 15000));
-  let response;
-  let bodyText = "";
-
-  try {
-    response = await fetch(`${baseUrl}/${encodeURIComponent(apiKey)}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
-    bodyText = await response.text();
-  } finally {
-    clearTimeout(timeout);
-  }
-
-  let data;
-  try {
-    data = bodyText ? JSON.parse(bodyText) : {};
-  } catch {
-    throw new Error(`Jooble returned non-JSON response: ${bodyText.slice(0, 500)}`);
-  }
-
-  if (!response.ok) {
-    throw new Error(`Jooble request failed: ${response.status} ${bodyText.slice(0, 500)}`);
-  }
-
-  if (!Array.isArray(data.jobs)) {
-    throw new Error("Jooble response did not include jobs array");
-  }
-
-  return data;
-}
-
-async function fetchJoobleCandidates(searchProfile = {}) {
-  const query = buildJoobleQuery(searchProfile);
-  if (!query) {
-    return {
-      needsProfile: true,
-      candidates: [],
-    };
-  }
-
-  const data = await joobleRequest(query);
-  const exclusions = profileBlockedTerms(searchProfile);
-  const candidates = data.jobs
-    .map((job) => joobleJobToCandidate(job, searchProfile))
-    .filter(Boolean)
-    .filter((job) => !jobContainsExcludedTerm(job, exclusions));
-
-  return {
-    totalCount: data.totalCount || candidates.length,
-    candidates,
-  };
-}
-
-async function douRequest() {
-  const feedUrl = process.env.DOU_FEED_URL || "https://jobs.dou.ua/vacancies/feeds/";
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), Number(process.env.DOU_TIMEOUT_MS || 15000));
-  let response;
-  let bodyText = "";
-
-  try {
-    response = await fetch(feedUrl, {
-      headers: {
-        "user-agent": "JobSearcherBot/0.1 (+Telegram job search assistant)",
-        accept: "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
-      },
-      signal: controller.signal,
-    });
-    bodyText = await response.text();
-  } finally {
-    clearTimeout(timeout);
-  }
-
-  if (!response.ok) {
-    throw new Error(`DOU feed request failed: ${response.status}`);
-  }
-
-  return bodyText;
-}
-
-async function rssFeedRequest(feedUrl, timeoutMs, sourceName) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  let response;
-  let bodyText = "";
-
-  try {
-    response = await fetch(feedUrl, {
-      headers: {
-        "user-agent": "JobSearcherBot/0.1 (+Telegram job search assistant)",
-        accept: "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
-      },
-      signal: controller.signal,
-    });
-    bodyText = await response.text();
-  } finally {
-    clearTimeout(timeout);
-  }
-
-  if (!response.ok) {
-    throw new Error(`${sourceName} feed request failed: ${response.status}`);
-  }
-
-  return bodyText;
-}
-
-function splitDouTitle(rawTitle) {
-  const title = String(rawTitle || "").trim();
-  const match = title.match(/^(.*?)\s+(?:в|at)\s+(.+?)(?:,\s*(.+))?$/i);
-  if (!match) return { title, company: "не указано", location: "не указано" };
-
-  return {
-    title: match[1].trim(),
-    company: match[2].trim(),
-    location: (match[3] || "").trim() || "не указано",
-  };
-}
-
-function douItemToCandidate(item, searchProfile = {}) {
-  const sourceUrl = item.link;
-  if (!item.title || !sourceUrl) return null;
-
-  const titleParts = splitDouTitle(item.title);
-  const job = {
-    title: titleParts.title,
-    company: titleParts.company,
-    location: titleParts.location,
-    snippet: item.description,
-  };
-  const format = inferWorkFormat(job);
-  const risks = [];
-  if (format === "не указано") risks.push("Формат работы нужно проверить в источнике.");
-
-  return {
-    source: "dou",
-    externalId: item.guid || sourceUrl,
-    sourceUrl,
-    title: titleParts.title,
-    company: titleParts.company,
-    location: titleParts.location,
-    format,
-    salary: "Не указана",
-    description: item.description || "",
-    reasons: ["Вакансия найдена на профильной украинской IT-платформе."],
-    risks,
-  };
-}
-
-async function fetchDouCandidates(searchProfile = {}) {
-  if (!buildJoobleQuery(searchProfile)) {
-    return {
-      needsProfile: true,
-      candidates: [],
-    };
-  }
-
-  const xml = await douRequest();
-  const exclusions = profileBlockedTerms(searchProfile);
-  const candidates = parseRssItems(xml)
-    .map((item) => douItemToCandidate(item, searchProfile))
-    .filter(Boolean)
-    .filter((job) => profileMatchesCandidate(searchProfile, job))
-    .filter((job) => !jobContainsExcludedTerm(job, exclusions));
-
-  return {
-    totalCount: candidates.length,
-    candidates,
-  };
-}
-
-function extractSalaryFromText(value) {
-  const text = String(value || "");
-  const match = text.match(/(?:\$|€|₴)\s?\d[\d\s,.]*(?:\s?[–-]\s?(?:\$|€|₴)?\s?\d[\d\s,.]*)?|\d[\d\s,.]*(?:\s?[–-]\s?\d[\d\s,.]*)?\s?(?:USD|EUR|UAH|грн)/i);
-  return match ? match[0].replace(/\s+/g, " ").trim() : "Не указана";
-}
-
-function splitDjinniTitle(rawTitle) {
-  const title = String(rawTitle || "").trim();
-  const knownSuffixes = ["Responds Quickly", "Relocate", "Remote"];
-  let cleaned = title;
-  for (const suffix of knownSuffixes) {
-    cleaned = cleaned.replace(new RegExp(`\\s+${suffix}\\b`, "i"), "");
-  }
-  cleaned = cleaned.replace(/\s+\${1,5}\s*$/, "").trim();
-
-  const separators = [" at ", " в "];
-  for (const separator of separators) {
-    const index = cleaned.toLowerCase().lastIndexOf(separator);
-    if (index > 0) {
-      return {
-        title: cleaned.slice(0, index).trim(),
-        company: cleaned.slice(index + separator.length).trim() || "не указано",
-      };
-    }
-  }
-
-  return {
-    title: cleaned,
-    company: "не указано",
-  };
-}
-
-function djinniItemToCandidate(item, searchProfile = {}) {
-  const sourceUrl = item.link;
-  if (!item.title || !sourceUrl) return null;
-
-  const titleParts = splitDjinniTitle(item.title);
-  const job = {
-    title: titleParts.title,
-    company: titleParts.company,
-    location: item.description,
-    snippet: item.description,
-  };
-  const format = inferWorkFormat(job);
-  const risks = [];
-  if (format === "не указано") risks.push("Формат работы нужно проверить в источнике.");
-
-  return {
-    source: "djinni",
-    externalId: item.guid || sourceUrl,
-    sourceUrl,
-    title: titleParts.title,
-    company: titleParts.company,
-    location: item.description.match(/(?:Full Remote|Remote|Ukraine|Worldwide|EU|Europe|Kyiv|Lviv|Dnipro|Odesa)[^·\n]*/i)?.[0]?.trim() || "не указано",
-    format,
-    salary: extractSalaryFromText(`${item.title} ${item.description}`),
-    description: item.description || "",
-    reasons: ["Вакансия найдена на украинской tech-платформе."],
-    risks,
-  };
-}
-
-async function fetchDjinniCandidates(searchProfile = {}) {
-  if (!buildJoobleQuery(searchProfile)) {
-    return {
-      needsProfile: true,
-      candidates: [],
-    };
-  }
-
-  const feedUrl = process.env.DJINNI_FEED_URL || "https://djinni.co/jobs/rss/";
-  const xml = await rssFeedRequest(feedUrl, Number(process.env.DJINNI_TIMEOUT_MS || 15000), "Djinni");
-  const exclusions = profileBlockedTerms(searchProfile);
-  const candidates = parseRssItems(xml)
-    .map((item) => djinniItemToCandidate(item, searchProfile))
-    .filter(Boolean)
-    .filter((job) => profileMatchesCandidate(searchProfile, job))
-    .filter((job) => !jobContainsExcludedTerm(job, exclusions));
-
-  return {
-    totalCount: candidates.length,
-    candidates,
-  };
-}
-
-async function fetchCandidatesFromSources(searchProfile = {}) {
-  const sourceFetchers = [
-    ["jooble", fetchJoobleCandidates],
-    ["dou", fetchDouCandidates],
-    ["djinni", fetchDjinniCandidates],
-  ];
-  const candidates = [];
-  const failures = [];
-  let needsProfile = false;
-
-  for (const [source, fetcher] of sourceFetchers) {
-    try {
-      const result = await fetcher(searchProfile);
-      if (result.needsProfile) needsProfile = true;
-      candidates.push(...(result.candidates || []));
-    } catch (error) {
-      console.error(`[bot] ${source} source failed: ${error.message}`);
-      failures.push(source);
-    }
-  }
-
-  return {
-    needsProfile,
-    candidates,
-    failures,
-  };
+function setTelegramTransportForTests(transport) {
+  telegramTransportForTests = transport;
 }
 
 async function openAiRequest(payload) {
@@ -1911,7 +1206,7 @@ function resumeAnalysisPrompt(text) {
 async function sendMessage(chatId, text, options = {}) {
   return telegramRequest("sendMessage", {
     chat_id: chatId,
-    text,
+    text: telegramText(text),
     ...options,
   });
 }
@@ -2029,8 +1324,13 @@ async function showStartMenu(chatId) {
       "",
       "Лучший путь: сначала загрузить резюме, я его проанализирую, а потом попрошу дополнить только недостающие детали.",
     ].join("\n"),
-    replyKeyboard(START_KEYBOARD)
+    replyKeyboard(startKeyboard())
   );
+}
+
+async function sendGuide(chatId) {
+  await sendMessage(chatId, guideText(), removeKeyboard());
+  await showStartMenu(chatId);
 }
 
 async function startResumeUploadFlow(store, user, chatId) {
@@ -2156,6 +1456,205 @@ async function sendPersonalVacancyBatch(store, user, chatId, candidates, options
   await saveCurrentUser(user);
 }
 
+function saveSourceReport(user, result, trigger = "manual") {
+  user.lastSourceReport = {
+    trigger,
+    checkedAt: result.summary?.checkedAt || nowIso(),
+    totalCandidates: result.candidates?.length || 0,
+    failures: result.failures || [],
+    summary: result.summary || null,
+    reports: (result.sourceReports || []).map((report) => ({
+      source: report.source,
+      status: report.status,
+      count: Number.isFinite(report.count) ? report.count : 0,
+      totalCount: Number.isFinite(report.totalCount) ? report.totalCount : 0,
+      durationMs: Number.isFinite(report.durationMs) ? report.durationMs : null,
+      checkedAt: report.checkedAt || null,
+      errorCode: report.errorCode || null,
+    })),
+  };
+  user.updatedAt = nowIso();
+}
+
+function formatKyivDateTime(value) {
+  if (!value) return "не указано";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "не указано";
+  const parts = localDateTimeParts(date);
+  return `${parts.date} ${parts.time} Kyiv`;
+}
+
+function sourceStatusText(report) {
+  if (report.status === "ok") {
+    const countText = report.count === report.totalCount
+      ? `${report.count}`
+      : `${report.count} из ${report.totalCount}`;
+    return `работает, найдено ${countText}`;
+  }
+  if (report.status === "needs_profile") return "нужен профиль поиска";
+  if (report.status === "failed") return "временно недоступен";
+  return "статус неясен";
+}
+
+function formatSourceStatusMessage(user) {
+  const sourceReport = user.lastSourceReport;
+  if (!sourceReport?.reports?.length) {
+    return [
+      "Пока нет отчета по источникам.",
+      "",
+      "Нажми /find_now или дождись ближайшей рассылки, и я покажу статус платформ после проверки.",
+    ].join("\n");
+  }
+
+  const lines = [
+    "Статус источников по последнему поиску:",
+    `Проверка: ${formatKyivDateTime(sourceReport.checkedAt)}`,
+    `Найдено всего: ${sourceReport.totalCandidates || 0}`,
+    "",
+    ...sourceReport.reports.map((report) => {
+      const label = SOURCE_LABELS[report.source] || report.source;
+      return `- ${label}: ${sourceStatusText(report)}`;
+    }),
+  ];
+
+  if ((sourceReport.failures || []).length) {
+    lines.push("", "Если источник временно недоступен, я попробую снова в следующем поиске.");
+  }
+
+  return lines.join("\n");
+}
+
+async function showSourceStatus(store, user, chatId) {
+  ensureUserCollections(user);
+  await sendMessage(chatId, formatSourceStatusMessage(user), removeKeyboard());
+  await showStartMenu(chatId);
+}
+
+function favoriteJobs(user, statuses = ["saved", "applied"]) {
+  ensureUserCollections(user);
+  const allowed = new Set(statuses);
+  const jobsByUrl = new Map();
+  for (const job of [...(user.foundJobs || []), ...(user.sentJobs || [])]) {
+    if (!job?.sourceUrl || !allowed.has(job.status)) continue;
+    const previous = jobsByUrl.get(job.sourceUrl);
+    const previousDate = Date.parse(previous?.feedbackUpdatedAt || previous?.savedAt || previous?.sentAt || previous?.foundAt || 0) || 0;
+    const currentDate = Date.parse(job.feedbackUpdatedAt || job.savedAt || job.sentAt || job.foundAt || 0) || 0;
+    if (!previous || currentDate >= previousDate) jobsByUrl.set(job.sourceUrl, job);
+  }
+
+  return [...jobsByUrl.values()].sort((left, right) => {
+    const leftDate = Date.parse(left.feedbackUpdatedAt || left.savedAt || left.sentAt || left.foundAt || 0) || 0;
+    const rightDate = Date.parse(right.feedbackUpdatedAt || right.savedAt || right.sentAt || right.foundAt || 0) || 0;
+    return rightDate - leftDate;
+  });
+}
+
+function findFavoriteJob(user, shortId) {
+  ensureUserCollections(user);
+  return user.sentJobs.find((job) => job.shortId === shortId) ||
+    user.foundJobs.find((job) => job.shortId === shortId);
+}
+
+function updateFavoriteStatus(user, shortId, status) {
+  const updatedAt = nowIso();
+  let updatedJob = null;
+  for (const collection of [user.sentJobs || [], user.foundJobs || []]) {
+    for (const job of collection) {
+      if (job.shortId !== shortId) continue;
+      job.status = status;
+      job.feedback = status === "saved" ? "s" : job.feedback;
+      job.feedbackUpdatedAt = updatedAt;
+      if (status === "saved" && !job.savedAt) job.savedAt = updatedAt;
+      if (status === "applied") job.appliedAt = updatedAt;
+      if (status === "archived") job.archivedAt = updatedAt;
+      updatedJob = job;
+    }
+  }
+  user.updatedAt = updatedAt;
+  return updatedJob;
+}
+
+async function syncFavoriteToMiniApp(user, job, status = job?.status || "saved") {
+  const apiUrl = favoritesApiUrl();
+  const secret = process.env.FAVORITES_API_SECRET;
+  if (!apiUrl || !secret || !job?.shortId || !job?.sourceUrl) return false;
+
+  const response = await fetch(`${apiUrl}/api/bot/favorites`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${secret}`,
+    },
+    body: JSON.stringify({
+      user: {
+        id: user.id,
+        telegramChatId: user.telegramChatId,
+        telegramUserId: user.telegramUserId,
+      },
+      job: {
+        ...job,
+        status,
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(`favorites sync failed: ${response.status} ${body.slice(0, 300)}`);
+  }
+  return true;
+}
+
+function miniAppUserId(user) {
+  return user?.telegramUserId || user?.id || user?.telegramChatId || null;
+}
+
+async function deleteFavoritesFromMiniApp(user) {
+  const apiUrl = favoritesApiUrl();
+  const secret = process.env.FAVORITES_API_SECRET;
+  const userId = miniAppUserId(user);
+  if (!apiUrl || !secret || !userId) return false;
+
+  const response = await fetch(`${apiUrl}/api/bot/users/${encodeURIComponent(userId)}/favorites`, {
+    method: "DELETE",
+    headers: {
+      authorization: `Bearer ${secret}`,
+    },
+  });
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(`favorites delete failed: ${response.status} ${body.slice(0, 300)}`);
+  }
+  return true;
+}
+
+async function showFavorites(store, user, chatId) {
+  ensureUserCollections(user);
+  const webAppKeyboard = favoritesWebAppKeyboard();
+  if (webAppKeyboard) {
+    await sendMessage(
+      chatId,
+      "Открой отдельное окно с сохраненными вакансиями.",
+      webAppKeyboard
+    );
+    await showStartMenu(chatId);
+    return;
+  }
+
+  const jobs = favoriteJobs(user).slice(0, 5);
+  if (!jobs.length) {
+    await sendMessage(chatId, "В избранном пока пусто. Нажимай «Сохранить» под вакансиями, которые хочешь рассмотреть для отклика.");
+    await showStartMenu(chatId);
+    return;
+  }
+
+  await sendMessage(chatId, `В избранном ${favoriteJobs(user).length}. Показываю первые ${jobs.length}.`);
+  for (const job of jobs) {
+    await sendMessage(chatId, formatFavoriteMessage(job), favoriteActionKeyboard(job));
+  }
+  await showStartMenu(chatId);
+}
+
 async function findNow(store, user, chatId) {
   user.searchProfile = normalizeSearchProfile(user.searchProfile || {});
   if (!user.searchProfile || Object.keys(user.searchProfile).length === 0 || !profileHasSearchData(user.searchProfile)) {
@@ -2189,6 +1688,9 @@ async function findNow(store, user, chatId) {
 
   try {
     const result = await fetchCandidatesFromSources(user.searchProfile);
+    saveSourceReport(user, result, "manual");
+    await saveCurrentUser(user);
+
     if (result.needsProfile) {
       await sendMessage(chatId, "В профиле не хватает ролей для поиска. Добавь роли через /preferences.");
       return;
@@ -2245,6 +1747,7 @@ async function runDigestForUser(store, user, due) {
 
   try {
     const result = await fetchCandidatesFromSources(user.searchProfile);
+    saveSourceReport(user, result, `digest:${due.slot}`);
     const stored = storeFoundJobs(user, result.candidates);
     await saveCurrentUser(user);
 
@@ -2740,6 +2243,7 @@ async function handleJobFeedbackCallback(store, user, callbackQuery) {
   sentJob.feedback = signal;
   sentJob.status = FEEDBACK_STATUS_BY_SIGNAL[signal] || "sent";
   sentJob.feedbackUpdatedAt = nowIso();
+  if (signal === "s" && !sentJob.savedAt) sentJob.savedAt = sentJob.feedbackUpdatedAt;
   markFoundJobFeedback(user, sentJob, signal);
   updateLearnedPreferencesFromFeedback(user);
 
@@ -2751,6 +2255,14 @@ async function handleJobFeedbackCallback(store, user, callbackQuery) {
 
   if (signal === "d" || signal === "h") {
     await hideVacancyMessage(chatId, sentJob.messageId || callbackQuery.message?.message_id);
+  }
+
+  if (signal === "s") {
+    try {
+      await syncFavoriteToMiniApp(user, sentJob, "saved");
+    } catch (error) {
+      console.error(`[bot] favorites sync failed: ${error.message}`);
+    }
   }
 
   if (stats.total === 5 || stats.total === 10) {
@@ -2767,6 +2279,44 @@ async function handleJobFeedbackCallback(store, user, callbackQuery) {
       );
     }
   }
+}
+
+async function handleFavoriteCallback(store, user, callbackQuery) {
+  const chatId = callbackQuery.message?.chat?.id;
+  const [, action, shortId] = (callbackQuery.data || "").split(":");
+  const statusByAction = {
+    a: "applied",
+    r: "archived",
+  };
+  const status = statusByAction[action];
+  if (!chatId || !shortId || !status) {
+    await answerCallbackQuery(callbackQuery.id, "Эта кнопка устарела.");
+    return;
+  }
+
+  ensureUserCollections(user);
+  const existingJob = findFavoriteJob(user, shortId);
+  if (!existingJob) {
+    await answerCallbackQuery(callbackQuery.id, "Не нашел эту вакансию в избранном.");
+    return;
+  }
+
+  const updatedJob = updateFavoriteStatus(user, shortId, status);
+  await saveCurrentUser(user);
+  try {
+    await syncFavoriteToMiniApp(user, updatedJob, status);
+  } catch (error) {
+    console.error(`[bot] favorites status sync failed: ${error.message}`);
+  }
+
+  if (status === "applied") {
+    await answerCallbackQuery(callbackQuery.id, "Отметил: откликнулся.");
+    await editMessageText(chatId, callbackQuery.message?.message_id, "Отметил вакансию как «Откликнулся».");
+    return;
+  }
+
+  await answerCallbackQuery(callbackQuery.id, "Убрал из избранного.");
+  await hideVacancyMessage(chatId, callbackQuery.message?.message_id);
 }
 
 async function handleLearningPreferenceCallback(store, user, callbackQuery) {
@@ -2850,6 +2400,11 @@ async function handleCallbackQuery(callbackQuery) {
     return;
   }
 
+  if (callbackQuery.data?.startsWith("fav:")) {
+    await handleFavoriteCallback(null, user, callbackQuery);
+    return;
+  }
+
   if (callbackQuery.data?.startsWith("lp:")) {
     await handleLearningPreferenceCallback(null, user, callbackQuery);
     return;
@@ -2859,10 +2414,15 @@ async function handleCallbackQuery(callbackQuery) {
 }
 
 async function deleteUserData(store, user, chatId) {
+  try {
+    await deleteFavoritesFromMiniApp(user);
+  } catch (error) {
+    console.error(`[bot] favorites delete failed: ${error.message}`);
+  }
   await deleteUser(user.id);
   await sendMessage(
     chatId,
-    "Твои данные удалены из локального хранилища бота. Если захочешь начать заново, отправь /start.",
+    "Твои данные удалены из хранилища бота. Если захочешь начать заново, отправь /start.",
     removeKeyboard()
   );
 }
@@ -2871,11 +2431,13 @@ function helpText() {
   return [
     "Команды:",
     "/start - главное меню",
+    "/guide - как пользоваться ботом",
     "/preferences - заполнить или изменить профиль поиска",
     "/profile - показать текущий профиль",
     "/upload_resume - загрузить резюме",
     "/find_now - найти вакансии сейчас",
     "/found_jobs - показать уже найденные вакансии",
+    "/source_status - статус платформ поиска",
     "/delete_my_data - удалить свои данные",
     "/cancel - отменить текущую настройку",
     "/help - помощь",
@@ -2889,19 +2451,20 @@ async function handleCommand(store, user, message) {
 
   if (command === "/start") {
     user.flow = null;
+    const shouldShowGuide = !user.onboardingShownAt;
+    if (shouldShowGuide) user.onboardingShownAt = nowIso();
     await saveCurrentUser(user);
-    await sendMessage(
-      chatId,
-      [
-        "Привет. Я Job Searcher bot.",
-        "",
-        "Сначала загрузи резюме. Я его проанализирую, покажу что понял, потом спрошу что дополнить и создам профиль поиска.",
-        "",
-        helpText(),
-      ].join("\n"),
-      removeKeyboard()
-    );
+    if (shouldShowGuide) {
+      await sendGuide(chatId);
+      return;
+    }
+    await sendMessage(chatId, "Привет. Открыл главное меню.", removeKeyboard());
     await showStartMenu(chatId);
+    return;
+  }
+
+  if (command === "/guide") {
+    await sendGuide(chatId);
     return;
   }
 
@@ -2931,6 +2494,16 @@ async function handleCommand(store, user, message) {
     return;
   }
 
+  if (command === "/favorites") {
+    await showFavorites(store, user, chatId);
+    return;
+  }
+
+  if (command === "/source_status") {
+    await showSourceStatus(store, user, chatId);
+    return;
+  }
+
   if (command === "/delete_my_data") {
     user.flow = {
       name: "delete_confirmation",
@@ -2955,7 +2528,7 @@ async function handleCommand(store, user, message) {
     return;
   }
 
-  await sendMessage(chatId, "Я пока знаю команды /upload_resume, /preferences, /profile, /find_now, /found_jobs, /delete_my_data, /cancel и /help.");
+  await sendMessage(chatId, "Я пока знаю команды /guide, /upload_resume, /preferences, /profile, /find_now, /found_jobs, /source_status, /delete_my_data, /cancel и /help. Избранное открывается отдельной кнопкой в меню.");
 }
 
 async function handleMenuText(store, user, message) {
@@ -2985,6 +2558,21 @@ async function handleMenuText(store, user, message) {
 
   if (text === "Показать найденные") {
     await showFoundJobs(store, user, chatId);
+    return true;
+  }
+
+  if (text === "Инструкция") {
+    await sendGuide(chatId);
+    return true;
+  }
+
+  if (text === FAVORITES_BUTTON_TEXT || text === "Избранные") {
+    await showFavorites(store, user, chatId);
+    return true;
+  }
+
+  if (text === "Статус источников") {
+    await showSourceStatus(store, user, chatId);
     return true;
   }
 
@@ -3061,11 +2649,32 @@ async function handleMessage(message) {
   await sendMessage(chatId, "Чтобы заполнить профиль поиска, отправь /preferences.");
 }
 
+function updateCreatedAt(update) {
+  return update.message?.date || update.callback_query?.message?.date || null;
+}
+
+function shouldSkipStaleUpdate(update, startedAtUnix) {
+  const createdAt = updateCreatedAt(update);
+  return Boolean(createdAt && createdAt < startedAtUnix);
+}
+
+async function processTelegramUpdate(update, startedAtUnix) {
+  if (shouldSkipStaleUpdate(update, startedAtUnix)) return;
+
+  if (update.message) {
+    await handleMessage(update.message);
+  }
+  if (update.callback_query) {
+    await handleCallbackQuery(update.callback_query);
+  }
+}
+
 async function pollUpdates() {
-  const state = await loadBotState();
+  const startedAtUnix = Math.floor(Date.now() / 1000);
 
   while (true) {
     try {
+      const state = await loadBotState();
       const updates = await telegramRequest(
         "getUpdates",
         {
@@ -3077,15 +2686,14 @@ async function pollUpdates() {
       );
 
       for (const update of updates) {
-        if (update.message) {
-          await handleMessage(update.message);
+        try {
+          await processTelegramUpdate(update, startedAtUnix);
+        } catch (error) {
+          console.error(`[bot] update ${update.update_id} failed: ${error.message}`);
+        } finally {
+          state.offset = update.update_id + 1;
+          await saveBotState(state);
         }
-        if (update.callback_query) {
-          await handleCallbackQuery(update.callback_query);
-        }
-
-        state.offset = update.update_id + 1;
-        await saveBotState(state);
       }
     } catch (error) {
       if (error.telegramErrorCode === 409) {
@@ -3104,11 +2712,13 @@ async function setupBotCommands() {
   await telegramRequest("setMyCommands", {
     commands: [
       { command: "start", description: "Главное меню" },
+      { command: "guide", description: "Как пользоваться ботом" },
       { command: "preferences", description: "Заполнить или изменить профиль поиска" },
       { command: "profile", description: "Показать текущий профиль" },
       { command: "upload_resume", description: "Загрузить резюме" },
       { command: "find_now", description: "Найти вакансии сейчас" },
       { command: "found_jobs", description: "Показать найденные вакансии" },
+      { command: "source_status", description: "Статус платформ поиска" },
       { command: "delete_my_data", description: "Удалить свои данные" },
       { command: "cancel", description: "Отменить текущую настройку" },
       { command: "help", description: "Помощь" },
@@ -3116,15 +2726,150 @@ async function setupBotCommands() {
   });
 }
 
-async function main() {
+async function setupBotMenuButton() {
+  const url = telegramWebAppUrl();
+  await telegramRequest("setChatMenuButton", {
+    menu_button: url
+      ? {
+          type: "web_app",
+          text: FAVORITES_BUTTON_TEXT,
+          web_app: { url },
+        }
+      : { type: "commands" },
+  });
+}
+
+function webhookPath() {
+  return process.env.TELEGRAM_WEBHOOK_PATH || "/telegram/webhook";
+}
+
+async function readRequestBody(request, maxBytes = 1024 * 1024) {
+  const chunks = [];
+  let size = 0;
+
+  for await (const chunk of request) {
+    size += chunk.length;
+    if (size > maxBytes) {
+      throw new Error("request_body_too_large");
+    }
+    chunks.push(chunk);
+  }
+
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+function sendJson(response, statusCode, data) {
+  response.writeHead(statusCode, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+  });
+  response.end(JSON.stringify(data));
+}
+
+function verifyWebhookSecret(request) {
+  const expected = process.env.TELEGRAM_WEBHOOK_SECRET;
+  if (!expected) return true;
+  return request.headers["x-telegram-bot-api-secret-token"] === expected;
+}
+
+async function setupTelegramWebhook() {
+  const url = process.env.WEBHOOK_URL || process.env.TELEGRAM_WEBHOOK_URL;
+  if (!url) {
+    console.warn("[bot] WEBHOOK_URL is not set. HTTP server will start, but Telegram webhook was not registered.");
+    return;
+  }
+
+  const payload = {
+    url,
+    allowed_updates: ["message", "callback_query"],
+    drop_pending_updates: false,
+  };
+  if (process.env.TELEGRAM_WEBHOOK_SECRET) {
+    payload.secret_token = process.env.TELEGRAM_WEBHOOK_SECRET;
+  }
+
+  await telegramRequest("setWebhook", payload);
+}
+
+function createWebhookServer() {
+  const startedAtUnix = Math.floor(Date.now() / 1000);
+  const pathName = webhookPath();
+
+  return http.createServer(async (request, response) => {
+    const url = new URL(request.url, "http://localhost");
+
+    if (request.method === "GET" && url.pathname === "/health") {
+      sendJson(response, 200, { ok: true, mode: "webhook" });
+      return;
+    }
+
+    if (request.method !== "POST" || url.pathname !== pathName) {
+      sendJson(response, 404, { error: "not_found" });
+      return;
+    }
+
+    if (!verifyWebhookSecret(request)) {
+      sendJson(response, 401, { error: "unauthorized" });
+      return;
+    }
+
+    let update;
+    try {
+      const body = await readRequestBody(request);
+      update = JSON.parse(body || "{}");
+    } catch (error) {
+      sendJson(response, 400, { error: error.message || "invalid_json" });
+      return;
+    }
+
+    sendJson(response, 200, { ok: true });
+    processTelegramUpdate(update, startedAtUnix).catch((error) => {
+      console.error(`[bot] webhook update ${update.update_id || "unknown"} failed: ${error.message}`);
+    });
+  });
+}
+
+async function startWebhookMode() {
   await loadEnv();
+  await acquireBotLock();
+  await ensureStorage();
+  if (process.env.SKIP_TELEGRAM_SETUP === "1") {
+    console.warn("[bot] SKIP_TELEGRAM_SETUP=1, Telegram commands/menu/webhook were not registered.");
+  } else {
+    await setupBotCommands();
+    await setupBotMenuButton();
+    await setupTelegramWebhook();
+  }
+  startDigestScheduler();
+
+  const port = Number(process.env.PORT || 3000);
+  const server = createWebhookServer();
+  server.listen(port, () => {
+    console.log(`[bot] starting Telegram webhook server on port ${port}`);
+  });
+}
+
+async function startPollingMode() {
+  await loadEnv();
+  await acquireBotLock();
   await ensureStorage();
   await telegramRequest("deleteWebhook", { drop_pending_updates: false });
   await setupBotCommands();
+  await setupBotMenuButton();
   startDigestScheduler();
 
   console.log("[bot] starting Telegram polling");
   await pollUpdates();
+}
+
+async function main() {
+  await loadEnv();
+  if (process.env.BOT_MODE === "webhook" || process.argv.includes("--webhook")) {
+    await startWebhookMode();
+    return;
+  }
+
+  await startPollingMode();
 }
 
 if (require.main === module) {
@@ -3140,6 +2885,7 @@ module.exports = {
   canonicalJobKey,
   createSentJob,
   defaultLearnedPreferences,
+  deleteFavoritesFromMiniApp,
   djinniItemToCandidate,
   douItemToCandidate,
   dueDigestSlot,
@@ -3147,20 +2893,53 @@ module.exports = {
   fetchCandidatesFromSources,
   fetchDjinniCandidates,
   fetchDouCandidates,
+  fetchHappyMondayCandidates,
   fetchJoobleCandidates,
+  fetchJobsUaCandidates,
+  fetchLobbyXCandidates,
+  fetchOlxUaCandidates,
+  fetchRobotaUaCandidates,
+  fetchWorkUaCandidates,
+  favoriteActionKeyboard,
+  favoriteJobs,
+  favoritesWebAppKeyboard,
+  formatFavoriteMessage,
+  formatSourceStatusMessage,
   formatVacancyMessage,
   getFeedbackStats,
+  guideText,
+  handleCallbackQuery,
+  handleMessage,
   hasActiveSearchProfile,
+  happyMondayItemToCandidate,
+  jobsUaJobToCandidate,
   jobMatchesHardPreferences,
   jobFeedbackKeyboard,
   joobleJobToCandidate,
+  lobbyXItemToCandidate,
   localDateTimeParts,
   normalizeJobCandidate,
   normalizeSearchProfile,
   parseRssItems,
+  parseJobsUaHtml,
+  parseOlxUaHtml,
+  parseRobotaUaHtml,
+  parseWorkUaHtml,
+  olxUaJobToCandidate,
   preferenceSuggestionKeyboard,
+  processTelegramUpdate,
   rankCandidatesForUser,
+  robotaUaJobToCandidate,
+  saveSourceReport,
   scoreCandidateForUser,
+  setTelegramTransportForTests,
+  shouldSkipStaleUpdate,
   splitDjinniTitle,
+  startKeyboard,
   storeFoundJobs,
+  syncFavoriteToMiniApp,
+  telegramWebAppUrl,
+  telegramText,
+  updateFavoriteStatus,
+  workUaJobToCandidate,
 };

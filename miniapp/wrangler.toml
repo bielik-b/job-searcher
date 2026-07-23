@@ -1,0 +1,10 @@
+name = "job-searcher-favorites"
+main = "worker.js"
+compatibility_date = "2026-07-23"
+workers_dev = true
+preview_urls = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "job-searcher-favorites"
+database_id = "b3ac83b6-01fd-443f-8c87-600e7c3f603f"

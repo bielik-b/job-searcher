@@ -42,19 +42,16 @@ The first useful version should support:
 - Jooble API: official API and broad aggregation. Implemented in MVP.
 - DOU RSS feed: public feed and strong for IT roles. Implemented in MVP.
 - Djinni RSS feed: public tech jobs feed. Implemented in MVP.
-- Work.ua public/search alerts.
-- robota.ua public/search alerts.
+- Work.ua public search HTML adapter. Implemented as best-effort source.
+- robota.ua public search HTML adapter. Implemented as best-effort source.
+- Jobs.ua public search HTML adapter. Implemented as best-effort source.
+- OLX Robota public search HTML adapter. Implemented as best-effort source with extended-search noise filtering.
+- Happy Monday public WordPress REST search adapter. Implemented as best-effort source.
+- Lobby X public WordPress REST search adapter. Implemented as best-effort source.
 
 ### Phase 2 Sources
 
-- LinkedIn Jobs.
-- OLX Robota.
-- Jobs.ua.
-- GRC.UA.
-- Happy Monday.
-- Lobby X.
-- Telegram job channels.
-- Company career pages found by Perplexity or similar search tools.
+- No additional job platforms are planned for the current roadmap.
 
 ### Access Rules
 
@@ -306,7 +303,7 @@ The Feedback Learner must wait for several sent vacancies or explicit feedback e
     Stores users, resumes, profiles, jobs, matches, feedback, digest state, source sync state, and logs. The local MVP uses SQLite with JSON migration backups; PostgreSQL remains the later deployment target.
 
 11. **Admin/Debug Interface**
-    Optional MVP+ tool for inspecting source health, match explanations, and failed jobs.
+    Optional MVP+ tool for inspecting source health, match explanations, and failed jobs. MVP now includes per-user last source status in Telegram.
 
 ## 9. Suggested Tech Stack
 
@@ -423,10 +420,21 @@ Risks:
 /profile
 /find_now
 /found_jobs
+/favorites
 /delete_my_data
 /cancel
 /help
 ```
+
+### Favorites Mini App
+
+Saved vacancies are managed as a lightweight application funnel:
+
+- `saved`: user wants to review the vacancy later.
+- `applied`: user has sent an application.
+- `archived`: user removed the vacancy from favorites.
+
+The Telegram bot keeps a chat fallback for `/favorites`, while the preferred UX is a Telegram Mini App opened from the `Избранные` button. The Mini App is served by a Cloudflare Worker and stores per-user favorites in Cloudflare D1. User access is verified with Telegram Web App `initData`; bot-to-Mini-App sync uses a shared `FAVORITES_API_SECRET`.
 
 ### Automatic Delivery
 
@@ -486,7 +494,12 @@ Admin commands are optional and must be limited to configured admin chat IDs:
 - Implement Jooble adapter as the first real source. Done.
 - Implement DOU adapter. Done.
 - Implement Djinni adapter. Done.
+- Implement Work.ua best-effort public search adapter. Done.
+- Implement robota.ua best-effort public search adapter. Done.
+- Implement Happy Monday best-effort WordPress REST search adapter. Done.
+- Implement Lobby X best-effort WordPress REST search adapter. Done.
 - Implement basic per-user matching and daily digest.
+- Implement favorites funnel with Telegram Mini App scaffold, local chat fallback, and optional Cloudflare D1 sync. Done.
 - Implement profile statuses (`draft`, `needs_review`, `active`) and block manual/scheduled search for unconfirmed profiles. Done.
 - Implement confirmation-based learned preference suggestions for repeated negative feedback. Done.
 - Implement SQLite storage layer with idempotent migration from JSON and structured foundation tables. Done.
@@ -494,17 +507,22 @@ Admin commands are optional and must be limited to configured admin chat IDs:
 ### Phase 2: Better Matching
 
 - Add embeddings.
-- Add LLM match explanations.
+- Add deterministic match summaries in vacancy cards. Done.
+- Add optional LLM match explanations after latency/cost controls.
 - Improve learned preference suggestions beyond basic repeated company/keyword detection.
-- Add deduplication beyond URL/source ID.
-- Add Work.ua and robota.ua adapters after public access/API checks.
+- Add deduplication beyond URL/source ID using conservative title/company similarity. Done.
+- Improve public-source resilience and add per-user source health diagnostics. Done.
+- Enrich Happy Monday and Lobby X candidates from detail REST endpoints, filtering clearly closed/removed vacancies. Done.
+- Preserve availability/enrichment metadata in found and sent job JSON records. Done.
 
 ### Phase 3: Coverage and Reliability
 
-- Add LinkedIn, OLX, Jobs.ua, GRC.UA, Happy Monday, Lobby X.
+- Harden current source adapters and delivery reliability before considering any new platform.
+- Move Telegram bot from laptop polling to hosted webhook mode. Runtime support has been added with `npm run bot:webhook`, `GET /health`, `POST /telegram/webhook`, Dockerfile, Fly.io config, and GitHub Actions deployment workflow.
+- Add queryable SQL availability/enrichment columns when admin analytics need them.
 - Add Perplexity-assisted source discovery.
 - Add job availability validation.
-- Add source health monitoring.
+- Add historical source health monitoring.
 - Add admin/debug view.
 
 ### Phase 4: Application Support
@@ -577,4 +595,5 @@ The MVP is successful when:
 - each match includes score, reasons, risks, and source link;
 - user feedback changes future recommendations;
 - user feedback changes only that user's recommendations;
-- user can delete personal data.
+- user can delete personal data;
+- production bot runs from hosted webhook infrastructure, not from a local laptop.

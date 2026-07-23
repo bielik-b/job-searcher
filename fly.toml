@@ -1,0 +1,35 @@
+app = "bielik-job-searcher-bot"
+primary_region = "fra"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  BOT_MODE = "webhook"
+  PORT = "3000"
+  DATA_DIR = "/data"
+  SQLITE_PATH = "/data/job-searcher.sqlite"
+  PYTHON_BIN = "python3"
+  TELEGRAM_WEBHOOK_PATH = "/telegram/webhook"
+  WEBHOOK_URL = "https://bielik-job-searcher-bot.fly.dev/telegram/webhook"
+  TELEGRAM_WEBAPP_URL = "https://job-searcher-favorites.bielik-job-searcher.workers.dev/"
+  FAVORITES_API_URL = "https://job-searcher-favorites.bielik-job-searcher.workers.dev"
+  LLM_PROVIDER = "google"
+  EXTERNAL_LLM_PROVIDER = "google"
+  GOOGLE_MODEL = "gemini-3.6-flash"
+
+[mounts]
+  source = "job_searcher_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

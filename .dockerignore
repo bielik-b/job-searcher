@@ -1,0 +1,7 @@
+.git
+.codegraph
+node_modules
+data
+.env
+*.log
+npm-debug.log*
