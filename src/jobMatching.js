@@ -258,8 +258,41 @@ function dueDigestSlot(user, date = new Date()) {
   };
 }
 
+function normalizeSourceUrl(value) {
+  const rawValue = String(value || "").trim();
+  if (!rawValue || rawValue.length > 2048) return null;
+
+  try {
+    const parsed = new URL(rawValue);
+    if (!["http:", "https:"].includes(parsed.protocol)) return null;
+    if (!parsed.hostname || /\/wp-json(?:\/|$)/i.test(parsed.pathname)) return null;
+    if (parsed.pathname === "/" && !parsed.search) return null;
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+function normalizeJobLocation(value) {
+  const location = String(value || "").replace(/\s+/g, " ").trim();
+  if (!location) return "не указано";
+
+  const firstPart = location.split(/(?<=[.!?])\s+|[·|•]\s*/u)[0]?.trim();
+  if (
+    firstPart &&
+    firstPart !== location &&
+    /(?:remote|віддал|удален|hybrid|гібрид|office|офіс|ukraine|україна|kyiv|київ|lviv|львів|dnipro|дніпро|odesa|одеса)/i.test(firstPart)
+  ) {
+    return firstPart;
+  }
+
+  if (location.length <= 120) return location;
+  if (firstPart && firstPart.length <= 120) return firstPart;
+  return `${location.slice(0, 117).trimEnd()}...`;
+}
+
 function normalizeJobCandidate(candidate) {
-  const sourceUrl = candidate.sourceUrl || candidate.url || candidate.source_url;
+  const sourceUrl = normalizeSourceUrl(candidate.sourceUrl || candidate.url || candidate.source_url);
   if (!candidate.title || !sourceUrl) return null;
 
   return {
@@ -269,7 +302,7 @@ function normalizeJobCandidate(candidate) {
     sourceUrl,
     title: candidate.title,
     company: candidate.company || "не указано",
-    location: candidate.location || "не указано",
+    location: normalizeJobLocation(candidate.location),
     format: candidate.format || "не указано",
     salary: candidate.salary || "не указано",
     description: candidate.description || "",
@@ -840,8 +873,10 @@ module.exports = {
   localDateTimeParts,
   lowerList,
   normalizeJobCandidate,
+  normalizeJobLocation,
   normalizeSalary,
   normalizeSearchProfile,
+  normalizeSourceUrl,
   parseSalaryText,
   profileBlockedTerms,
   profileHasSearchData,

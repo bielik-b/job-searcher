@@ -303,6 +303,26 @@ test("job sources merge successful adapters and isolate a failing source", async
   });
 });
 
+test("djinni parser extracts location without swallowing the vacancy description", () => {
+  const sources = createTestSources(async () => response(true, 200, ""));
+  const candidate = sources.djinniItemToCandidate({
+    title: "Content Marketing Specialist Remote",
+    link: "https://djinni.co/jobs/123-content-marketing-specialist/",
+    guid: "djinni-123",
+    description: "remote work. Opportunity to work on a global B2B FinTech product. Access to professional AI and SEO tools.",
+  });
+
+  assert.equal(candidate.location, "remote");
+  assert.equal(candidate.sourceUrl, "https://djinni.co/jobs/123-content-marketing-specialist/");
+
+  const ukrainianCandidate = sources.djinniItemToCandidate({
+    title: "Product Manager",
+    link: "https://djinni.co/jobs/124-product-manager/",
+    description: "Віддалено. Робота з міжнародною командою.",
+  });
+  assert.equal(ukrainianCandidate.location, "Віддалено");
+});
+
 test("workua parser extracts candidates from public search html", () => {
   const sources = createTestSources(async () => response(true, 200, ""));
   const jobs = sources.parseWorkUaHtml(`
@@ -321,6 +341,22 @@ test("workua parser extracts candidates from public search html", () => {
   assert.equal(jobs[0].title, "AI Product Manager");
   assert.equal(jobs[0].company, "Product Lab");
   assert.equal(jobs[0].sourceUrl, "https://www.work.ua/jobs/42/");
+});
+
+test("workua parser prefers an explicit location over publication metadata", () => {
+  const sources = createTestSources(async () => response(true, 200, ""));
+  const jobs = sources.parseWorkUaHtml(`
+    <main>
+      <div id="job-43">
+        <h2><a href="/jobs/43/">Product Manager</a></h2>
+        <span class="text-muted">Опубліковано сьогодні</span>
+        <span class="location">Remote</span>
+        <p>Remote product role.</p>
+      </div>
+    </main>
+  `);
+
+  assert.equal(jobs[0].location, "Remote");
 });
 
 test("robotaua parser extracts candidates from public search html", () => {
@@ -388,6 +424,26 @@ test("jobsua parser extracts candidates from public search html", () => {
   assert.equal(jobs[0].location, "Київ");
   assert.equal(jobs[0].salary, "50 000 грн. + %");
   assert.equal(jobs[0].sourceUrl, "https://jobs.ua/job-digital-product-marketing-manager-3852247");
+});
+
+test("jobsua parser rejects placeholder and unsafe vacancy links", () => {
+  const sources = createTestSources(async () => response(true, 200, ""));
+  const jobs = sources.parseJobsUaHtml(`
+    <ul>
+      <li class="b-vacancy__item js-item_list" id="1">
+        <a class="js-item_title" href="#">Placeholder Product Manager</a>
+      </li>
+      <li class="b-vacancy__item js-item_list" id="2">
+        <a class="js-item_title" href="javascript:alert(1)">Unsafe Product Manager</a>
+      </li>
+      <li class="b-vacancy__item js-item_list" id="3">
+        <a class="js-item_title" href="/job-product-manager-3">Product Manager</a>
+      </li>
+    </ul>
+  `);
+
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].sourceUrl, "https://jobs.ua/job-product-manager-3");
 });
 
 test("olxua parser extracts job cards and skips extended search ads", () => {
@@ -471,6 +527,9 @@ test("wordpress source adapters ignore wrong subtypes and incomplete items", asy
           id: 2,
           title: "Product Manager до Missing Url",
           subtype: "job",
+          _links: {
+            self: [{ href: "https://happymonday.ua/wp-json/wp/v2/job/2" }],
+          },
         },
         {
           id: 3,

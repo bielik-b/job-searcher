@@ -21,6 +21,7 @@ const {
   localDateTimeParts,
   lowerList,
   normalizeJobCandidate,
+  normalizeSourceUrl,
   normalizeSalary,
   normalizeSearchProfile,
   profileBlockedTerms,
@@ -540,7 +541,17 @@ function formatValue(value) {
 function telegramText(value) {
   const text = String(value || "");
   if (text.length <= MAX_TELEGRAM_MESSAGE_LENGTH) return text;
-  return `${text.slice(0, MAX_TELEGRAM_MESSAGE_LENGTH - 80)}\n\nТекст сокращен. Полная вакансия доступна по ссылке источника.`;
+
+  const sourceMatch = text.match(/(?:^|\n)(Источник:\s+https?:\/\/\S+)\s*$/i);
+  if (sourceMatch) {
+    const suffix = `\n\nТекст сокращен. Полная вакансия доступна по ссылке источника.\n${sourceMatch[1]}`;
+    const body = text.slice(0, sourceMatch.index).trimEnd();
+    const bodyLimit = Math.max(0, MAX_TELEGRAM_MESSAGE_LENGTH - suffix.length);
+    return `${body.slice(0, bodyLimit).trimEnd()}${suffix}`;
+  }
+
+  const suffix = "\n\nТекст сокращен.";
+  return `${text.slice(0, MAX_TELEGRAM_MESSAGE_LENGTH - suffix.length).trimEnd()}${suffix}`;
 }
 
 function formatProfile(profile = {}) {
@@ -1573,11 +1584,13 @@ function favoriteJobs(user, statuses = ["saved", "applied"]) {
   const allowed = new Set(statuses);
   const jobsByUrl = new Map();
   for (const job of [...(user.foundJobs || []), ...(user.sentJobs || [])]) {
-    if (!job?.sourceUrl || !allowed.has(job.status)) continue;
-    const previous = jobsByUrl.get(job.sourceUrl);
+    const sourceUrl = normalizeSourceUrl(job?.sourceUrl);
+    if (!sourceUrl || !allowed.has(job.status)) continue;
+    const normalizedJob = sourceUrl === job.sourceUrl ? job : { ...job, sourceUrl };
+    const previous = jobsByUrl.get(sourceUrl);
     const previousDate = Date.parse(previous?.feedbackUpdatedAt || previous?.savedAt || previous?.sentAt || previous?.foundAt || 0) || 0;
     const currentDate = Date.parse(job.feedbackUpdatedAt || job.savedAt || job.sentAt || job.foundAt || 0) || 0;
-    if (!previous || currentDate >= previousDate) jobsByUrl.set(job.sourceUrl, job);
+    if (!previous || currentDate >= previousDate) jobsByUrl.set(sourceUrl, normalizedJob);
   }
 
   return [...jobsByUrl.values()].sort((left, right) => {

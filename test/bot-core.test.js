@@ -8,6 +8,7 @@ const {
   jobMatchesHardPreferences,
   jobsAreLikelySame,
   normalizeJobCandidate,
+  normalizeJobLocation,
   normalizeSearchProfile,
   rankCandidatesForUser,
   storeFoundJobs,
@@ -272,6 +273,29 @@ test("normalizeJobCandidate preserves availability metadata with safe defaults",
   assert.equal(fallback.detailStatusCode, null);
 });
 
+test("normalizeJobCandidate rejects missing and unsafe source links", () => {
+  assert.equal(normalizeJobCandidate({
+    title: "Product Manager",
+    sourceUrl: "",
+  }), null);
+  assert.equal(normalizeJobCandidate({
+    title: "Product Manager",
+    sourceUrl: "javascript:alert(1)",
+  }), null);
+  assert.equal(normalizeJobCandidate({
+    title: "Product Manager",
+    sourceUrl: "/relative/job/1",
+  }), null);
+});
+
+test("normalizeJobLocation prevents descriptions from filling the location field", () => {
+  assert.equal(
+    normalizeJobLocation("remote work. Opportunity to work on a global B2B product with a large team."),
+    "remote work."
+  );
+  assert.equal(normalizeJobLocation("Kyiv, Ukraine"), "Kyiv, Ukraine");
+});
+
 test("createSentJob preserves availability metadata", () => {
   const user = activeUser();
   const sentJob = createSentJob(user, {
@@ -326,6 +350,12 @@ test("favorites helpers collect saved jobs and update local status", () => {
         sourceUrl: "https://jobs.test/2",
         title: "Hidden Job",
         status: "hidden",
+      },
+      {
+        shortId: "j_invalid",
+        sourceUrl: "https://jobs.test/#",
+        title: "Invalid source",
+        status: "saved",
       },
     ],
   });
@@ -412,6 +442,15 @@ test("telegram text is capped below Telegram message limit", () => {
   assert.ok(capped.length <= 3900);
   assert.match(capped, /Текст сокращен/);
   assert.equal(telegramText("short"), "short");
+});
+
+test("telegram text keeps the source link when a vacancy message is shortened", () => {
+  const sourceUrl = "https://example.com/jobs/content-marketing-specialist";
+  const capped = telegramText(`${"Длинное описание ".repeat(400)}\n\nИсточник: ${sourceUrl}`);
+
+  assert.ok(capped.length <= 3900);
+  assert.match(capped, /Текст сокращен/);
+  assert.match(capped, new RegExp(`Источник: ${sourceUrl}$`));
 });
 
 test("favorites sync posts saved jobs to configured mini app api", async () => {

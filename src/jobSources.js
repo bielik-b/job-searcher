@@ -266,8 +266,15 @@ function createJobSources({
 
   function absoluteJobsUaUrl(value) {
     const baseUrl = (env.JOBS_UA_BASE_URL || env.JOBSUA_BASE_URL || "https://jobs.ua").replace(/\/+$/, "");
-    if (/^https?:\/\//i.test(value)) return value;
-    return `${baseUrl}${String(value || "").startsWith("/") ? "" : "/"}${value || ""}`;
+    const rawValue = decodeHtmlEntities(value);
+    if (!rawValue || /^(?:#|javascript:|data:|mailto:)/i.test(rawValue)) return "";
+
+    try {
+      const url = new URL(rawValue, baseUrl);
+      return ["http:", "https:"].includes(url.protocol) ? url.toString() : "";
+    } catch {
+      return "";
+    }
   }
 
   function slugifyJobsUaKeyword(value) {
@@ -377,7 +384,7 @@ function createJobSources({
   }
 
   function wpSearchUrl(item) {
-    return item?.url || item?.link || item?._links?.self?.[0]?.href || "";
+    return item?.url || item?.link || "";
   }
 
   function wpRenderedText(value) {
@@ -684,7 +691,10 @@ function createJobSources({
       const companyMatch = afterTitle.match(/<a[^>]+href=["'][^"']*(?:\/jobs\/by-company\/|\/en\/jobs\/by-company\/|\/ru\/jobs\/by-company\/)[^"']*["'][^>]*>([\s\S]*?)<\/a>/i);
       const salaryMatch = cardHtml.match(/<span[^>]*class=["'][^"']*(?:salary|strong)[^"']*["'][^>]*>([\s\S]*?(?:грн|uah|\$|€)[\s\S]*?)<\/span>/i) ||
         cardHtml.match(/(?:^|>|\s)((?:\$|€|₴)\s?\d[\d\s,.]*(?:\s?[–-]\s?(?:\$|€|₴)?\s?\d[\d\s,.]*)?|\d[\d\s,.]*(?:\s?[–-]\s?\d[\d\s,.]*)?\s?(?:грн|UAH|USD|EUR))(?:<|\s|$)/i);
-      const locationMatch = cardHtml.match(/<span[^>]*class=["'][^"']*(?:location|city|text-muted)[^"']*["'][^>]*>([\s\S]*?)<\/span>/i);
+      const explicitLocationMatch = cardHtml.match(/<span[^>]*class=["'][^"']*(?:location|city)[^"']*["'][^>]*>([\s\S]*?)<\/span>/i);
+      const mutedLocationMatch = [...cardHtml.matchAll(/<span[^>]*class=["'][^"']*text-muted[^"']*["'][^>]*>([\s\S]*?)<\/span>/gi)]
+        .find((match) => !/(?:опубліковано|опубликовано|сьогодні|сегодня|today|ago|тому)/i.test(stripHtml(match[1])));
+      const locationMatch = explicitLocationMatch || mutedLocationMatch;
       const paragraphMatch = afterTitle.match(/<p[^>]*>([\s\S]*?)<\/p>/i);
 
       return {
@@ -823,6 +833,7 @@ function createJobSources({
 
       const title = stripHtml(titleMatch[2]);
       const sourceUrl = absoluteJobsUaUrl(titleMatch[1]);
+      if (!sourceUrl) return null;
       const companyMatch = cardHtml.match(/<span[^>]+class=["'][^"']*\blink__hidden\b[^"']*["'][^>]*title=["']([^"']+)["'][^>]*>/i);
       const locationMatch = cardHtml.match(/fa-map-marker[\s\S]*?<a[^>]*>([\s\S]*?)<\/a>/i);
       const scheduleMatch = cardHtml.match(/<span[^>]*class=["'][^"']*\bcaption\b[^"']*["'][^>]*>\s*Графік роботи:\s*<\/span>[\s\S]*?<span[^>]*class=["'][^"']*\bblack-text\b[^"']*["'][^>]*>([\s\S]*?)<\/span>/i);
@@ -1013,6 +1024,25 @@ function createJobSources({
     };
   }
 
+  function djinniLocationFromDescription(value) {
+    const text = stripHtml(value).slice(0, 240);
+    const knownLocationPattern = /(?<![\p{L}\p{N}])(?:Full Remote|Remote|Worldwide|Ukraine|Europe|EU|Kyiv|Lviv|Dnipro|Odesa|Україна|Київ|Львів|Дніпро|Одеса|Віддалено)(?![\p{L}\p{N}])/giu;
+    const locations = [];
+
+    for (const match of text.matchAll(knownLocationPattern)) {
+      const location = match[0];
+      const key = /^(?:full remote|remote|віддалено)$/i.test(location)
+        ? "remote"
+        : location.toLocaleLowerCase();
+      if (!locations.some((item) => item.key === key)) {
+        locations.push({ key, value: location });
+      }
+      if (locations.length >= 2) break;
+    }
+
+    return locations.map((item) => item.value).join(", ") || "не указано";
+  }
+
   function djinniItemToCandidate(item, searchProfile = {}) {
     const sourceUrl = item.link;
     if (!item.title || !sourceUrl) return null;
@@ -1034,7 +1064,7 @@ function createJobSources({
       sourceUrl,
       title: titleParts.title,
       company: titleParts.company,
-      location: item.description.match(/(?:Full Remote|Remote|Ukraine|Worldwide|EU|Europe|Kyiv|Lviv|Dnipro|Odesa)[^·\n]*/i)?.[0]?.trim() || "не указано",
+      location: djinniLocationFromDescription(item.description),
       format,
       salary: extractSalaryFromText(`${item.title} ${item.description}`),
       description: item.description || "",
