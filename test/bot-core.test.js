@@ -25,11 +25,16 @@ const {
   saveSourceReport,
   shouldSkipStaleUpdate,
   startKeyboard,
+  settingsKeyboard,
   syncFavoriteToMiniApp,
   telegramWebAppUrl,
   telegramText,
   updateFavoriteStatus,
 } = require("../src/bot");
+
+function keyboardTexts(keyboard) {
+  return keyboard.flat().map((item) => (typeof item === "object" ? item.text : item));
+}
 
 function activeUser(overrides = {}) {
   return {
@@ -342,8 +347,8 @@ test("favorites web app button appears only when url is configured", () => {
   try {
     delete process.env.TELEGRAM_WEBAPP_URL;
     assert.equal(telegramWebAppUrl(), "");
-    assert.equal(startKeyboard().flat().includes("Избранное"), true);
-    assert.equal(startKeyboard().flat().includes("Инструкция"), true);
+    assert.equal(keyboardTexts(startKeyboard()).includes("Избранное"), true);
+    assert.equal(keyboardTexts(startKeyboard()).includes("Инструкция"), true);
 
     process.env.TELEGRAM_WEBAPP_URL = "https://favorites.example/";
     const button = startKeyboard().flat().find((item) => typeof item === "object" && item.text === "Избранное");
@@ -359,11 +364,33 @@ test("favorites web app button appears only when url is configured", () => {
   }
 });
 
+test("main and settings keyboards expose every regular action without slash commands", () => {
+  assert.deepEqual(keyboardTexts(startKeyboard()), [
+    "Найти вакансии",
+    "Мои вакансии",
+    "Избранное",
+    "Резюме",
+    "Профиль поиска",
+    "Инструкция",
+    "Настройки / данные",
+  ]);
+
+  assert.deepEqual(keyboardTexts(settingsKeyboard()), [
+    "Показать профиль",
+    "Статус источников",
+    "Удалить мои данные",
+    "Главное меню",
+    "Отмена",
+  ]);
+});
+
 test("guide text explains onboarding without technical AI terms", () => {
   const text = guideText();
 
-  assert.match(text, /Загрузи резюме/);
-  assert.match(text, /черновик профиля поиска/);
+  assert.match(text, /Что делают кнопки/);
+  assert.match(text, /Резюме/);
+  assert.match(text, /Найти вакансии/);
+  assert.match(text, /Настройки \/ данные/);
   assert.match(text, /09:00, 13:00 и 21:00/);
   assert.match(text, /Избранное/);
   assert.doesNotMatch(text, /\b(?:LLM|Ollama|OpenAI|provider|model)\b/i);

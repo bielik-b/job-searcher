@@ -119,19 +119,20 @@ async function main() {
   try {
     await handleMessage(userMessage("/start"));
     let texts = outgoingTexts(calls);
-    assert.ok(texts.some((text) => text.includes("Как это работает:")), "first /start should show onboarding guide");
-    assert.ok(texts.some((text) => text.includes("Что делаем дальше?")), "/start should show main menu");
+    assert.ok(texts.some((text) => text.includes("С чего начать:")), "first /start should show onboarding guide");
+    assert.ok(texts.some((text) => text.includes("Что делают кнопки:")), "first /start should explain menu buttons");
+    assert.ok(texts.some((text) => text.includes("Главное меню")), "/start should show main menu");
 
     calls.length = 0;
     await handleMessage(userMessage("/guide"));
     texts = outgoingTexts(calls);
-    assert.ok(texts.some((text) => text.includes("Как это работает:")), "/guide should show guide");
+    assert.ok(texts.some((text) => text.includes("С чего начать:")), "/guide should show guide");
 
     const user = activeSmokeUser(await storage.getUser(String(CHAT_ID)));
     await storage.saveUser(user);
 
     calls.length = 0;
-    await handleMessage(userMessage("Показать найденные"));
+    await handleMessage(userMessage("Мои вакансии"));
     texts = outgoingTexts(calls);
     assert.equal(
       texts.filter((text) => text === "Вот вакансии, которые я уже нашел для тебя.").length,

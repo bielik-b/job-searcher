@@ -45,6 +45,19 @@ const LOCK_PATH = path.join(DATA_DIR, "bot.lock");
 const EXTRACT_SCRIPT_PATH = path.join(PROJECT_ROOT, "scripts", "extract_resume_text.py");
 const execFile = promisify(execFileCallback);
 const FAVORITES_BUTTON_TEXT = "Избранное";
+const MENU_BUTTONS = {
+  find: "Найти вакансии",
+  found: "Мои вакансии",
+  resume: "Резюме",
+  profile: "Профиль поиска",
+  guide: "Инструкция",
+  settings: "Настройки / данные",
+  showProfile: "Показать профиль",
+  sourceStatus: "Статус источников",
+  deleteData: "Удалить мои данные",
+  main: "Главное меню",
+  cancel: "Отмена",
+};
 const MAX_TELEGRAM_MESSAGE_LENGTH = 3900;
 let telegramTransportForTests = null;
 
@@ -63,11 +76,18 @@ function favoritesKeyboardButton() {
 
 function startKeyboard() {
   return [
-    ["Загрузить резюме"],
-    ["Найти вакансии сейчас", "Показать найденные"],
-    [favoritesKeyboardButton(), "Инструкция"],
-    ["Статус источников"],
-    ["Заполнить профиль вручную", "Показать профиль"],
+    [MENU_BUTTONS.find, MENU_BUTTONS.found],
+    [favoritesKeyboardButton(), MENU_BUTTONS.resume],
+    [MENU_BUTTONS.profile, MENU_BUTTONS.guide],
+    [MENU_BUTTONS.settings],
+  ];
+}
+
+function settingsKeyboard() {
+  return [
+    [MENU_BUTTONS.showProfile, MENU_BUTTONS.sourceStatus],
+    [MENU_BUTTONS.deleteData],
+    [MENU_BUTTONS.main, MENU_BUTTONS.cancel],
   ];
 }
 
@@ -548,26 +568,30 @@ function formatProfile(profile = {}) {
 
 function guideText() {
   return [
-    "Привет. Я помогу искать подходящие вакансии по твоему резюме.",
+    "Привет. Я помогу искать подходящие вакансии по твоему резюме и настройкам.",
     "",
-    "Как это работает:",
-    "1. Загрузи резюме PDF, DOCX или TXT.",
-    "2. Я составлю черновик профиля поиска.",
-    "3. Ты проверишь роли, локацию, формат, зарплату и ограничения.",
-    "4. Я буду присылать вакансии, а по твоим реакциям подбор станет точнее.",
+    "С чего начать:",
+    "1. Нажми «Резюме» и пришли файл PDF, DOCX или TXT.",
+    "2. Я прочитаю резюме и покажу черновик профиля поиска.",
+    "3. Проверь роли, локацию, формат работы, зарплату, языки и ограничения.",
+    "4. Нажми «Найти вакансии», чтобы получить первую подборку.",
     "",
-    "Основные функции:",
-    "Автоподбор - вакансии приходят в 09:00, 13:00 и 21:00 по Киеву.",
-    "Найти вакансии сейчас - ручной запуск поиска в любой момент.",
-    "Показать найденные - список уже найденных вакансий.",
-    "Избранное - отдельное окно со сохраненными вакансиями для отклика.",
-    "Статус источников - показывает, какие платформы отработали в последнем поиске.",
+    "Что делают кнопки:",
+    "Найти вакансии - запускает поиск свежих вакансий прямо сейчас.",
+    "Мои вакансии - показывает вакансии, которые уже были найдены для тебя.",
+    "Избранное - открывает сохраненные вакансии, к которым можно вернуться перед откликом.",
+    "Резюме - загрузить первое резюме или заменить его новым.",
+    "Профиль поиска - уточнить, какую работу искать: роль, город, формат, зарплату и стоп-слова.",
+    "Инструкция - снова показать это описание.",
+    "Настройки / данные - посмотреть профиль, проверить источники поиска или удалить свои данные.",
     "",
-    "Под вакансиями можно нажимать:",
-    "Подходит, Не подходит, Сохранить или Скрыть похожие.",
+    "Как работают вакансии:",
+    "Я автоматически присылаю подборки каждый день в 09:00, 13:00 и 21:00 по Киеву.",
+    "Под каждой вакансией есть кнопки «Подходит», «Не подходит», «Сохранить» и «Скрыть похожие». По этим реакциям подбор постепенно становится точнее.",
+    "В конце каждой вакансии есть ссылка на источник.",
     "",
-    "Начать лучше с кнопки «Загрузить резюме».",
-    "В конце каждой вакансии есть ссылка на источник. Данные можно удалить командой /delete_my_data.",
+    "Твои данные можно удалить в любой момент через «Настройки / данные».",
+    "Начать лучше с кнопки «Резюме».",
   ].join("\n");
 }
 
@@ -1320,9 +1344,9 @@ async function showStartMenu(chatId) {
   await sendMessage(
     chatId,
     [
-      "Что делаем дальше?",
+      "Главное меню",
       "",
-      "Лучший путь: сначала загрузить резюме, я его проанализирую, а потом попрошу дополнить только недостающие детали.",
+      "Выбери действие кнопкой ниже. Если ты здесь впервые, начни с «Резюме»: я прочитаю файл и помогу собрать профиль поиска.",
     ].join("\n"),
     replyKeyboard(startKeyboard())
   );
@@ -1331,6 +1355,20 @@ async function showStartMenu(chatId) {
 async function sendGuide(chatId) {
   await sendMessage(chatId, guideText(), removeKeyboard());
   await showStartMenu(chatId);
+}
+
+async function showDataSettingsMenu(chatId) {
+  await sendMessage(
+    chatId,
+    [
+      "Настройки и данные",
+      "",
+      "Показать профиль - покажу, какие роли, локация, формат, зарплата и ограничения сейчас сохранены.",
+      "Статус источников - покажу, какие платформы отработали в последнем поиске.",
+      "Удалить мои данные - удалю резюме, профиль, найденные вакансии и избранное после подтверждения.",
+    ].join("\n"),
+    replyKeyboard(settingsKeyboard())
+  );
 }
 
 async function startResumeUploadFlow(store, user, chatId) {
@@ -1348,9 +1386,9 @@ async function startResumeUploadFlow(store, user, chatId) {
       "",
       "Я проанализирую резюме, покажу черновик профиля поиска и спрошу, нужно ли что-то дополнить перед сохранением.",
       "",
-      "Команда /cancel отменит загрузку.",
+      "Кнопка «Отмена» отменит загрузку.",
     ].join("\n"),
-    removeKeyboard()
+    replyKeyboard([[MENU_BUTTONS.cancel]])
   );
 }
 
@@ -1804,9 +1842,10 @@ async function savePreferencesDraft(store, user, chatId) {
 
   await sendMessage(
     chatId,
-    `${formatProfile(user.searchProfile)}\n\nПрофиль сохранен. Его можно изменить командой /preferences.`,
+    `${formatProfile(user.searchProfile)}\n\nПрофиль сохранен. Его можно изменить кнопкой «Профиль поиска».`,
     removeKeyboard()
   );
+  await showStartMenu(chatId);
 }
 
 async function saveAnalyzedSearchProfile(store, user, chatId) {
@@ -1826,9 +1865,10 @@ async function saveAnalyzedSearchProfile(store, user, chatId) {
 
   await sendMessage(
     chatId,
-    `${formatProfile(user.searchProfile)}\n\nПрофиль поиска создан на основе резюме. Его можно изменить командой /preferences.`,
+    `${formatProfile(user.searchProfile)}\n\nПрофиль поиска создан на основе резюме. Его можно изменить кнопкой «Профиль поиска».`,
     removeKeyboard()
   );
+  await showStartMenu(chatId);
 }
 
 async function cancelFlow(store, user, chatId, text = "Настройка отменена.") {
@@ -1836,6 +1876,7 @@ async function cancelFlow(store, user, chatId, text = "Настройка отм
   user.updatedAt = nowIso();
   await saveCurrentUser(user);
   await sendMessage(chatId, text, removeKeyboard());
+  await showStartMenu(chatId);
 }
 
 async function handlePreferenceAnswer(store, user, message) {
@@ -2427,20 +2468,38 @@ async function deleteUserData(store, user, chatId) {
   );
 }
 
+async function startDeleteDataConfirmation(user, chatId) {
+  user.flow = {
+    name: "delete_confirmation",
+    startedAt: nowIso(),
+  };
+  await saveCurrentUser(user);
+  await sendMessage(
+    chatId,
+    [
+      "Удалить твои данные из хранилища бота?",
+      "",
+      "Будут удалены резюме, профиль поиска, найденные вакансии, реакции и избранное.",
+      "Для подтверждения нажми «УДАЛИТЬ». Для отмены нажми «Отмена».",
+    ].join("\n"),
+    replyKeyboard([["УДАЛИТЬ"], [MENU_BUTTONS.cancel]])
+  );
+}
+
 function helpText() {
   return [
-    "Команды:",
-    "/start - главное меню",
-    "/guide - как пользоваться ботом",
-    "/preferences - заполнить или изменить профиль поиска",
-    "/profile - показать текущий профиль",
-    "/upload_resume - загрузить резюме",
-    "/find_now - найти вакансии сейчас",
-    "/found_jobs - показать уже найденные вакансии",
-    "/source_status - статус платформ поиска",
-    "/delete_my_data - удалить свои данные",
-    "/cancel - отменить текущую настройку",
-    "/help - помощь",
+    "Все основные действия доступны кнопками в меню.",
+    "",
+    "Кнопки:",
+    "Найти вакансии - запустить поиск прямо сейчас.",
+    "Мои вакансии - открыть уже найденные вакансии.",
+    "Избранное - открыть сохраненные вакансии.",
+    "Резюме - загрузить или заменить резюме.",
+    "Профиль поиска - изменить роли, локацию, формат, зарплату и ограничения.",
+    "Настройки / данные - профиль, статус источников и удаление данных.",
+    "",
+    "Slash-команды тоже работают как запасной вариант:",
+    "/start, /guide, /preferences, /profile, /upload_resume, /find_now, /found_jobs, /favorites, /source_status, /delete_my_data, /cancel, /help",
   ].join("\n");
 }
 
@@ -2505,16 +2564,7 @@ async function handleCommand(store, user, message) {
   }
 
   if (command === "/delete_my_data") {
-    user.flow = {
-      name: "delete_confirmation",
-      startedAt: nowIso(),
-    };
-    await saveCurrentUser(user);
-    await sendMessage(
-      chatId,
-      "Удалить твои данные из локального хранилища бота? Напиши УДАЛИТЬ для подтверждения или Отмена.",
-      replyKeyboard([["УДАЛИТЬ"], ["Отмена"]])
-    );
+    await startDeleteDataConfirmation(user, chatId);
     return;
   }
 
@@ -2524,44 +2574,60 @@ async function handleCommand(store, user, message) {
   }
 
   if (command === "/help") {
-    await sendMessage(chatId, helpText());
+    await sendMessage(chatId, helpText(), removeKeyboard());
+    await showStartMenu(chatId);
     return;
   }
 
-  await sendMessage(chatId, "Я пока знаю команды /guide, /upload_resume, /preferences, /profile, /find_now, /found_jobs, /source_status, /delete_my_data, /cancel и /help. Избранное открывается отдельной кнопкой в меню.");
+  await sendMessage(chatId, "Я не узнал эту команду. Выбери действие кнопкой в меню или нажми «Инструкция».");
+  await showStartMenu(chatId);
 }
 
 async function handleMenuText(store, user, message) {
   const chatId = message.chat.id;
   const text = message.text?.trim();
 
-  if (text === "Заполнить профиль вручную") {
-    await startPreferencesFlow(store, user, chatId);
-    return true;
-  }
-
-  if (text === "Показать профиль") {
-    await sendMessage(chatId, formatProfile(user.searchProfile), removeKeyboard());
+  if (text === MENU_BUTTONS.main) {
     await showStartMenu(chatId);
     return true;
   }
 
-  if (text === "Загрузить резюме") {
+  if (text === MENU_BUTTONS.cancel) {
+    if (user.flow?.name) {
+      await cancelFlow(store, user, chatId);
+    } else {
+      await showStartMenu(chatId);
+    }
+    return true;
+  }
+
+  if (text === MENU_BUTTONS.profile || text === "Заполнить профиль вручную") {
+    await startPreferencesFlow(store, user, chatId);
+    return true;
+  }
+
+  if (text === MENU_BUTTONS.showProfile || text === "Показать профиль") {
+    await sendMessage(chatId, formatProfile(user.searchProfile), removeKeyboard());
+    await showDataSettingsMenu(chatId);
+    return true;
+  }
+
+  if (text === MENU_BUTTONS.resume || text === "Загрузить резюме") {
     await startResumeUploadFlow(store, user, chatId);
     return true;
   }
 
-  if (text === "Найти вакансии сейчас") {
+  if (text === MENU_BUTTONS.find || text === "Найти вакансии сейчас") {
     await findNow(store, user, chatId);
     return true;
   }
 
-  if (text === "Показать найденные") {
+  if (text === MENU_BUTTONS.found || text === "Показать найденные") {
     await showFoundJobs(store, user, chatId);
     return true;
   }
 
-  if (text === "Инструкция") {
+  if (text === MENU_BUTTONS.guide || text === "Инструкция") {
     await sendGuide(chatId);
     return true;
   }
@@ -2571,8 +2637,18 @@ async function handleMenuText(store, user, message) {
     return true;
   }
 
-  if (text === "Статус источников") {
+  if (text === MENU_BUTTONS.settings) {
+    await showDataSettingsMenu(chatId);
+    return true;
+  }
+
+  if (text === MENU_BUTTONS.sourceStatus || text === "Статус источников") {
     await showSourceStatus(store, user, chatId);
+    return true;
+  }
+
+  if (text === MENU_BUTTONS.deleteData) {
+    await startDeleteDataConfirmation(user, chatId);
     return true;
   }
 
@@ -2605,6 +2681,11 @@ async function handleMessage(message) {
 
   if (message.text?.startsWith("/")) {
     await handleCommand(null, user, message);
+    return;
+  }
+
+  if (message.text?.trim() === MENU_BUTTONS.cancel && user.flow?.name) {
+    await cancelFlow(null, user, chatId);
     return;
   }
 
@@ -2646,7 +2727,8 @@ async function handleMessage(message) {
     return;
   }
 
-  await sendMessage(chatId, "Чтобы заполнить профиль поиска, отправь /preferences.");
+  await sendMessage(chatId, "Я не понял сообщение. Выбери действие кнопкой ниже или нажми «Инструкция».");
+  await showStartMenu(chatId);
 }
 
 function updateCreatedAt(update) {
@@ -2933,6 +3015,7 @@ module.exports = {
   saveSourceReport,
   scoreCandidateForUser,
   setTelegramTransportForTests,
+  settingsKeyboard,
   shouldSkipStaleUpdate,
   splitDjinniTitle,
   startKeyboard,
